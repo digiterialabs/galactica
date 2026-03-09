@@ -7,8 +7,8 @@
 Create and push a semver tag:
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 That workflow builds native `galactica-cli` binaries for:
@@ -19,8 +19,8 @@ That workflow builds native `galactica-cli` binaries for:
 
 It packages them into release assets named like:
 
-- `galactica-cli-v0.1.3-aarch64-apple-darwin.tar.gz`
-- `galactica-cli-v0.1.3-x86_64-pc-windows-msvc.zip`
+- `galactica-cli-v0.1.4-aarch64-apple-darwin.tar.gz`
+- `galactica-cli-v0.1.4-x86_64-pc-windows-msvc.zip`
 
 The publish job also uploads `SHA256SUMS.txt`.
 

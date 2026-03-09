@@ -9,10 +9,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/galactica/runtime/v1/runtime.proto",
     ];
 
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(protos, &["../../proto"])?;
+        .compile_protos_with_config(config, protos, &["../../proto"])?;
 
     Ok(())
 }

@@ -156,7 +156,7 @@ With the current scheduler, repeated compatible requests will round-robin across
 - `galactica-cli` lives in `rust/galactica-cli/` and is the preferred entry point
 - The checked-in configs live under `config/dev/`
 - `just dev-detect`, `just dev-doctor`, `just dev-install`, `just dev-control-plane`, `just dev-token`, `just dev-gateway`, and `just dev-node` wrap the CLI
-- Tagged pushes like `v0.1.3` publish prebuilt `galactica-cli` archives through GitHub Releases via `.github/workflows/release.yml`
+- Tagged pushes like `v0.1.4` publish prebuilt `galactica-cli` archives through GitHub Releases via `.github/workflows/release.yml`
 - The first load of `qwen3.5-4b` can download artifacts from Hugging Face
 - The `llama.cpp` variant is pinned to `Qwen3.5-4B.Q4_K_M.gguf`
 - If Windows cannot see the control plane, check firewall rules for ports `9090`, `8080`, and `50061`

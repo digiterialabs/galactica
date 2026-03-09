@@ -17,6 +17,8 @@ tonic = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+prost-build = "0.13"
+protoc-bin-vendored = "3.2.0"
 
 [lints]
 workspace = true

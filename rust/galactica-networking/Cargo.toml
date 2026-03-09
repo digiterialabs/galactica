@@ -1,0 +1,15 @@
+[package]
+name = "galactica-networking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+galactica-common = { workspace = true }
+galactica-observability = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

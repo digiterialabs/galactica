@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = [
+    "rust/galactica-common",
+    "rust/galactica-observability",
+    "rust/galactica-networking",
+    "rust/galactica-artifact",
+    "rust/galactica-control-plane",
+    "rust/galactica-node-agent",
+    "rust/galactica-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/digiterialabs/galactica"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.release]
+opt-level = 3
+
+[workspace.dependencies]
+# Internal crates
+galactica-common = { path = "rust/galactica-common" }
+galactica-observability = { path = "rust/galactica-observability" }
+galactica-networking = { path = "rust/galactica-networking" }
+galactica-artifact = { path = "rust/galactica-artifact" }
+galactica-control-plane = { path = "rust/galactica-control-plane" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# gRPC / Protobuf
+tonic = "0.13"
+tonic-build = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+
+# HTTP / API
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Networking
+libp2p = { version = "0.55", features = ["tokio", "mdns", "noise", "yamux", "tcp", "gossipsub", "identify"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+url = "2"
+sha2 = "0.10"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+sysinfo = "0.34"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }

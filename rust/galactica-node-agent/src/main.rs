@@ -11,12 +11,30 @@ struct Cli {
     /// Path to configuration file
     #[arg(long, short)]
     config: Option<String>,
+
+    /// Log level
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    println!(
-        "galactica-node-agent connecting to {}",
-        cli.control_plane_addr
+
+    galactica_observability::init_tracing("galactica-node-agent", &cli.log_level);
+
+    tracing::info!(
+        control_plane = %cli.control_plane_addr,
+        "galactica-node-agent starting"
     );
+
+    let config = galactica_common::types::config::NodeAgentConfig {
+        control_plane_addr: cli.control_plane_addr,
+        ..Default::default()
+    };
+
+    let agent = galactica_node_agent::agent::NodeAgent::new(config);
+    agent.run().await?;
+
+    Ok(())
 }

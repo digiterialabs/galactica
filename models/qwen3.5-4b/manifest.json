@@ -1,0 +1,35 @@
+{
+  "model_id": "qwen3.5-4b",
+  "name": "Qwen3.5 4B",
+  "family": "chat",
+  "variants": [
+    {
+      "runtime": "mlx",
+      "quantization": "4bit",
+      "format": "mlx",
+      "size_bytes": 2684354560,
+      "compatible_accelerators": [
+        2
+      ]
+    },
+    {
+      "runtime": "llama.cpp",
+      "quantization": "q4_k_m",
+      "format": "gguf",
+      "size_bytes": 2684354560,
+      "compatible_accelerators": [
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "chat_template": "chatml",
+  "metadata": {
+    "source_model_id": "Qwen/Qwen3.5-4B",
+    "mlx_hf_repo": "mlx-community/Qwen3.5-4B-4bit",
+    "llama_cpp_hf_repo": "AaryanK/Qwen3.5-4B-GGUF",
+    "context_size": "8192",
+    "reasoning_budget": "0"
+  }
+}

@@ -7,6 +7,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-mlx/
+.venv-mlx314/
 dist/
 build/
 *.egg
@@ -20,6 +22,10 @@ node_modules/
 .next/
 out/
 .env*.local
+*.tsbuildinfo
+
+# Local runtime data
+var/
 
 # OS
 .DS_Store

@@ -16,10 +16,14 @@ use galactica_common::inference::{
 use galactica_common::proto::{common, control, node};
 use galactica_common::{GalacticaError, Result, chrono_to_timestamp, timestamp_to_chrono};
 use galactica_networking::issue_tls_identity;
+use galactica_observability::{
+    inject_trace_context_into_tonic_request, set_parent_from_tonic_request,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
+use tracing::{Instrument, info_span};
 
 pub use control::v1::control_plane_server::{ControlPlane, ControlPlaneServer};
 pub use store::{
@@ -40,6 +44,12 @@ const EXPIRES_AT_HEADER: &str = "x-galactica-expires-at";
 const ACTOR_HEADER: &str = "x-galactica-actor";
 const CREDENTIAL_KIND_HEADER: &str = "x-galactica-credential-kind";
 const NODE_FINGERPRINT_HEADER: &str = "x-galactica-node-fingerprint";
+
+fn rpc_server_span<T>(name: &'static str, request: &Request<T>) -> tracing::Span {
+    let span = info_span!("rpc.server", rpc.method = %name, otel.kind = "server");
+    set_parent_from_tonic_request(&span, request);
+    span
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TopologyGraph {
@@ -413,6 +423,8 @@ impl NodeExecutor for GrpcNodeExecutor {
                 .map_err(|error| {
                     GalacticaError::unavailable(format!("failed to connect node agent: {error}"))
                 })?;
+        let mut request = tonic::Request::new(request);
+        inject_trace_context_into_tonic_request(&mut request);
         client
             .load_model(request)
             .await
@@ -431,6 +443,8 @@ impl NodeExecutor for GrpcNodeExecutor {
                 .map_err(|error| {
                     GalacticaError::unavailable(format!("failed to connect node agent: {error}"))
                 })?;
+        let mut request = tonic::Request::new(request);
+        inject_trace_context_into_tonic_request(&mut request);
         client
             .execute_task(request)
             .await
@@ -569,6 +583,7 @@ where
             scopes: scopes.to_vec(),
             expires_at,
             require_mtls: tenant.require_mtls,
+            max_requests_per_minute: tenant.max_requests_per_minute,
             allowed_models: tenant.allowed_models,
             allowed_node_pools: tenant.allowed_node_pools,
             actor,
@@ -677,6 +692,7 @@ where
                 tenant_id: tenant.tenant_id,
                 scopes: tenant.scopes,
                 require_mtls: tenant.require_mtls,
+                max_requests_per_minute: tenant.max_requests_per_minute,
                 allowed_models: tenant.allowed_models,
                 allowed_node_pools: tenant.allowed_node_pools,
             };
@@ -705,6 +721,7 @@ where
                     "node:report".to_string(),
                 ],
                 require_mtls: tenant.require_mtls,
+                max_requests_per_minute: tenant.max_requests_per_minute,
                 allowed_models: tenant.allowed_models,
                 allowed_node_pools: tenant.allowed_node_pools,
             });
@@ -943,305 +960,428 @@ where
         &self,
         request: Request<control::v1::RegisterNodeRequest>,
     ) -> std::result::Result<Response<control::v1::RegisterNodeResponse>, Status> {
-        let identity = self.require_node_identity(&request).await?;
-        let auth = self
-            .authenticate_request(None, Some(identity.fingerprint.clone()))
-            .await?;
-        Self::ensure_scope(&auth, "node:register")?;
-        let request = request.into_inner();
-        let capabilities = request
-            .capabilities
-            .ok_or_else(|| Status::invalid_argument("capabilities are required"))?;
-        let node = self
-            .registry
-            .register_with_id(
-                identity.node_id.clone(),
-                request.hostname,
-                request.agent_endpoint,
-                capabilities,
-                request.version,
+        let span = rpc_server_span("control.register_node", &request);
+        async move {
+            let identity = self.require_node_identity(&request).await?;
+            let auth = self
+                .authenticate_request(None, Some(identity.fingerprint.clone()))
+                .await?;
+            Self::ensure_scope(&auth, "node:register")?;
+            let request = request.into_inner();
+            let capabilities = request
+                .capabilities
+                .ok_or_else(|| Status::invalid_argument("capabilities are required"))?;
+            let node = self
+                .registry
+                .register_with_id(
+                    identity.node_id.clone(),
+                    request.hostname,
+                    request.agent_endpoint,
+                    capabilities,
+                    request.version,
+                )
+                .await?;
+            self.audit(
+                auth.actor,
+                "node.register",
+                format!("node:{}", node.node_id),
+                "success",
+                BTreeMap::from([("hostname".to_string(), node.hostname.clone())]),
             )
             .await?;
-        self.audit(
-            auth.actor,
-            "node.register",
-            format!("node:{}", node.node_id),
-            "success",
-            BTreeMap::from([("hostname".to_string(), node.hostname.clone())]),
-        )
-        .await?;
-        Ok(Response::new(control::v1::RegisterNodeResponse {
-            node_id: Some(common::v1::NodeId {
-                value: node.node_id,
-            }),
-            registered_at: Some(chrono_to_timestamp(node.registered_at)),
-        }))
+            Ok(Response::new(control::v1::RegisterNodeResponse {
+                node_id: Some(common::v1::NodeId {
+                    value: node.node_id,
+                }),
+                registered_at: Some(chrono_to_timestamp(node.registered_at)),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn heartbeat(
         &self,
         request: Request<control::v1::HeartbeatRequest>,
     ) -> std::result::Result<Response<control::v1::HeartbeatResponse>, Status> {
-        let identity = self.require_node_identity(&request).await?;
-        let auth = self
-            .authenticate_request(None, Some(identity.fingerprint.clone()))
-            .await?;
-        Self::ensure_scope(&auth, "node:heartbeat")?;
-        let request = request.into_inner();
-        let node_id = request
-            .node_id
-            .as_ref()
-            .map(|node_id| node_id.value.as_str())
-            .ok_or_else(|| Status::invalid_argument("node_id is required"))?;
-        if node_id != identity.node_id {
-            return Err(
-                GalacticaError::unauthorized("node fingerprint does not match node_id").into(),
-            );
+        let span = rpc_server_span("control.heartbeat", &request);
+        async move {
+            let identity = self.require_node_identity(&request).await?;
+            let auth = self
+                .authenticate_request(None, Some(identity.fingerprint.clone()))
+                .await?;
+            Self::ensure_scope(&auth, "node:heartbeat")?;
+            let request = request.into_inner();
+            let node_id = request
+                .node_id
+                .as_ref()
+                .map(|node_id| node_id.value.as_str())
+                .ok_or_else(|| Status::invalid_argument("node_id is required"))?;
+            if node_id != identity.node_id {
+                return Err(GalacticaError::unauthorized(
+                    "node fingerprint does not match node_id",
+                )
+                .into());
+            }
+            self.registry
+                .heartbeat(node_id, request.system_memory)
+                .await?;
+            Ok(Response::new(control::v1::HeartbeatResponse {
+                server_time: Some(chrono_to_timestamp(Utc::now())),
+                heartbeat_interval_seconds: self.config.heartbeat_interval_seconds,
+            }))
         }
-        self.registry
-            .heartbeat(node_id, request.system_memory)
-            .await?;
-        Ok(Response::new(control::v1::HeartbeatResponse {
-            server_time: Some(chrono_to_timestamp(Utc::now())),
-            heartbeat_interval_seconds: self.config.heartbeat_interval_seconds,
-        }))
+        .instrument(span)
+        .await
     }
 
     async fn report_capabilities(
         &self,
         request: Request<control::v1::ReportCapabilitiesRequest>,
     ) -> std::result::Result<Response<control::v1::ReportCapabilitiesResponse>, Status> {
-        let identity = self.require_node_identity(&request).await?;
-        let auth = self
-            .authenticate_request(None, Some(identity.fingerprint.clone()))
-            .await?;
-        Self::ensure_scope(&auth, "node:report")?;
-        let request = request.into_inner();
-        let node_id = request
-            .node_id
-            .as_ref()
-            .map(|node_id| node_id.value.as_str())
-            .ok_or_else(|| Status::invalid_argument("node_id is required"))?;
-        if node_id != identity.node_id {
-            return Err(
-                GalacticaError::unauthorized("node fingerprint does not match node_id").into(),
-            );
+        let span = rpc_server_span("control.report_capabilities", &request);
+        async move {
+            let identity = self.require_node_identity(&request).await?;
+            let auth = self
+                .authenticate_request(None, Some(identity.fingerprint.clone()))
+                .await?;
+            Self::ensure_scope(&auth, "node:report")?;
+            let request = request.into_inner();
+            let node_id = request
+                .node_id
+                .as_ref()
+                .map(|node_id| node_id.value.as_str())
+                .ok_or_else(|| Status::invalid_argument("node_id is required"))?;
+            if node_id != identity.node_id {
+                return Err(GalacticaError::unauthorized(
+                    "node fingerprint does not match node_id",
+                )
+                .into());
+            }
+            let capabilities = request
+                .capabilities
+                .ok_or_else(|| Status::invalid_argument("capabilities are required"))?;
+            self.store
+                .update_node_capabilities(node_id, capabilities)
+                .await?;
+            Ok(Response::new(control::v1::ReportCapabilitiesResponse {}))
         }
-        let capabilities = request
-            .capabilities
-            .ok_or_else(|| Status::invalid_argument("capabilities are required"))?;
-        self.store
-            .update_node_capabilities(node_id, capabilities)
-            .await?;
-        Ok(Response::new(control::v1::ReportCapabilitiesResponse {}))
+        .instrument(span)
+        .await
     }
 
     async fn get_cluster_state(
         &self,
-        _request: Request<control::v1::GetClusterStateRequest>,
+        request: Request<control::v1::GetClusterStateRequest>,
     ) -> std::result::Result<Response<control::v1::GetClusterStateResponse>, Status> {
-        let state = self.store.get_state().await?;
-        Ok(Response::new(control::v1::GetClusterStateResponse {
-            nodes: state.nodes.values().map(NodeRecord::to_proto).collect(),
-            loaded_models: state
-                .instances
-                .values()
-                .filter(|instance| instance.status == InstanceStatus::Ready)
-                .map(|instance| control::v1::LoadedModel {
-                    instance_id: Some(common::v1::InstanceId {
-                        value: instance.instance_id.clone(),
-                    }),
-                    model_id: Some(common::v1::ModelId {
-                        value: instance.model_id.clone(),
-                    }),
-                    node_id: Some(common::v1::NodeId {
-                        value: instance.node_id.clone(),
-                    }),
-                    runtime: instance.runtime.clone(),
+        let span = rpc_server_span("control.get_cluster_state", &request);
+        async move {
+            let state = self.store.get_state().await?;
+            Ok(Response::new(control::v1::GetClusterStateResponse {
+                nodes: state.nodes.values().map(NodeRecord::to_proto).collect(),
+                loaded_models: state
+                    .instances
+                    .values()
+                    .filter(|instance| instance.status == InstanceStatus::Ready)
+                    .map(|instance| control::v1::LoadedModel {
+                        instance_id: Some(common::v1::InstanceId {
+                            value: instance.instance_id.clone(),
+                        }),
+                        model_id: Some(common::v1::ModelId {
+                            value: instance.model_id.clone(),
+                        }),
+                        node_id: Some(common::v1::NodeId {
+                            value: instance.node_id.clone(),
+                        }),
+                        runtime: instance.runtime.clone(),
+                    })
+                    .collect(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn list_events(
+        &self,
+        request: Request<control::v1::ListEventsRequest>,
+    ) -> std::result::Result<Response<control::v1::ListEventsResponse>, Status> {
+        let span = rpc_server_span("control.list_events", &request);
+        async move {
+            let auth = self.auth_from_metadata(&request).await?;
+            Self::ensure_scope(&auth, "inference:read")?;
+            let request = request.into_inner();
+            let events = self.store.get_events_since(request.since_sequence).await?;
+            let last_sequence = self.store.get_state().await?.last_sequence;
+            Ok(Response::new(control::v1::ListEventsResponse {
+                events: events
+                    .iter()
+                    .map(|event| control::v1::SequencedClusterEvent {
+                        sequence: event.sequence,
+                        event: Some(event_to_proto(event)),
+                    })
+                    .collect(),
+                last_sequence,
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn list_audit_records(
+        &self,
+        request: Request<control::v1::ListAuditRecordsRequest>,
+    ) -> std::result::Result<Response<control::v1::ListAuditRecordsResponse>, Status> {
+        let span = rpc_server_span("control.list_audit_records", &request);
+        async move {
+            let auth = self.auth_from_metadata(&request).await?;
+            Self::ensure_scope(&auth, "inference:read")?;
+            let request = request.into_inner();
+            let since = request.since.map(timestamp_to_chrono);
+            let limit = if request.limit == 0 {
+                usize::MAX
+            } else {
+                request.limit as usize
+            };
+            let records = ControlPlaneService::list_audit_records(self)
+                .await?
+                .into_iter()
+                .filter(|record| since.map(|since| record.timestamp >= since).unwrap_or(true))
+                .rev()
+                .take(limit)
+                .map(|record| control::v1::AuditRecord {
+                    event_id: record.event_id,
+                    timestamp: Some(chrono_to_timestamp(record.timestamp)),
+                    actor: record.actor,
+                    action: record.action,
+                    resource: record.resource,
+                    outcome: record.outcome,
+                    details: record.details.into_iter().collect(),
                 })
-                .collect(),
-        }))
+                .collect();
+            Ok(Response::new(control::v1::ListAuditRecordsResponse {
+                records,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn list_available_models(
         &self,
         request: Request<control::v1::ListAvailableModelsRequest>,
     ) -> std::result::Result<Response<control::v1::ListAvailableModelsResponse>, Status> {
-        let auth = self.auth_from_metadata(&request).await?;
-        Self::ensure_scope(&auth, "inference:read")?;
-        let request = request.into_inner();
-        let models = self
-            .artifacts
-            .list_models(
-                (!request.filter_runtime.is_empty()).then_some(request.filter_runtime.as_str()),
-                None,
-            )
-            .await?
-            .into_iter()
-            .filter(|manifest| {
-                auth.allowed_models.is_empty()
-                    || auth.allowed_models.iter().any(|allowed| {
-                        manifest.model_id.as_ref().map(|model_id| &model_id.value) == Some(allowed)
-                    })
-            })
-            .collect();
-        Ok(Response::new(control::v1::ListAvailableModelsResponse {
-            models,
-        }))
+        let span = rpc_server_span("control.list_available_models", &request);
+        async move {
+            let auth = self.auth_from_metadata(&request).await?;
+            Self::ensure_scope(&auth, "inference:read")?;
+            let request = request.into_inner();
+            let models = self
+                .artifacts
+                .list_models(
+                    (!request.filter_runtime.is_empty()).then_some(request.filter_runtime.as_str()),
+                    None,
+                )
+                .await?
+                .into_iter()
+                .filter(|manifest| {
+                    auth.allowed_models.is_empty()
+                        || auth.allowed_models.iter().any(|allowed| {
+                            manifest.model_id.as_ref().map(|model_id| &model_id.value)
+                                == Some(allowed)
+                        })
+                })
+                .collect();
+            Ok(Response::new(control::v1::ListAvailableModelsResponse {
+                models,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn infer(
         &self,
         request: Request<control::v1::InferRequest>,
     ) -> std::result::Result<Response<Self::InferStream>, Status> {
-        let auth = self.auth_from_metadata(&request).await?;
-        let chunks = self.infer_once(request.into_inner().into(), &auth).await?;
-        let stream = try_stream! {
-            for chunk in chunks {
-                yield control::v1::InferChunk::from(chunk);
-            }
-        };
-        Ok(Response::new(Box::pin(stream) as Self::InferStream))
+        let span = rpc_server_span("control.infer", &request);
+        async move {
+            let auth = self.auth_from_metadata(&request).await?;
+            let chunks = self.infer_once(request.into_inner().into(), &auth).await?;
+            let stream = try_stream! {
+                for chunk in chunks {
+                    yield control::v1::InferChunk::from(chunk);
+                }
+            };
+            Ok(Response::new(Box::pin(stream) as Self::InferStream))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn watch_events(
         &self,
         request: Request<control::v1::WatchEventsRequest>,
     ) -> std::result::Result<Response<Self::WatchEventsStream>, Status> {
-        let since = request.into_inner().since.map(timestamp_to_chrono);
-        let historical = self.store.get_events_since(0).await?;
-        let mut receiver = self.store.subscribe();
-        let stream = try_stream! {
-            for event in historical
-                .into_iter()
-                .filter(|event| since.map(|since| event.timestamp > since).unwrap_or(true))
-            {
-                yield event_to_proto(&event);
-            }
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => {
-                        if since.map(|since| event.timestamp > since).unwrap_or(true) {
-                            yield event_to_proto(&event);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+        let span = rpc_server_span("control.watch_events", &request);
+        async move {
+            let since = request.into_inner().since.map(timestamp_to_chrono);
+            let historical = self.store.get_events_since(0).await?;
+            let mut receiver = self.store.subscribe();
+            let stream = try_stream! {
+                for event in historical
+                    .into_iter()
+                    .filter(|event| since.map(|since| event.timestamp > since).unwrap_or(true))
+                {
+                    yield event_to_proto(&event);
                 }
-            }
-        };
-        Ok(Response::new(Box::pin(stream) as Self::WatchEventsStream))
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) => {
+                            if since.map(|since| event.timestamp > since).unwrap_or(true) {
+                                yield event_to_proto(&event);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            };
+            Ok(Response::new(Box::pin(stream) as Self::WatchEventsStream))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn enroll_node(
         &self,
         request: Request<control::v1::EnrollNodeRequest>,
     ) -> std::result::Result<Response<control::v1::EnrollNodeResponse>, Status> {
-        let request = request.into_inner();
-        let token_record = self
-            .store
-            .consume_enrollment_token(&request.enrollment_token)
-            .await?
-            .ok_or_else(|| Status::unauthenticated("invalid or expired enrollment token"))?;
-        validate_signed_token(
-            &self.config.enrollment_secret,
-            &request.enrollment_token,
-            &token_record.tenant_id,
-            token_record.expires_at.timestamp(),
-            &token_record.allowed_roles,
-        )?;
-        let node_id = format!("node-{}", uuid::Uuid::new_v4());
-        let identity_material = issue_tls_identity(
-            &node_id,
-            &request.hostname,
-            &self.config.enrollment_secret,
-            chrono::Duration::days(30),
-        )?;
-        let identity = NodeIdentityRecord {
-            node_id: node_id.clone(),
-            tenant_id: token_record.tenant_id.clone(),
-            certificate_pem: identity_material.certificate_pem.clone(),
-            private_key_pem: identity_material.private_key_pem.clone(),
-            fingerprint: identity_material.fingerprint.clone(),
-            issued_at: identity_material.issued_at,
-            expires_at: identity_material.expires_at,
-            hostname: request.hostname.clone(),
-        };
-        self.store.save_node_identity(identity.clone()).await?;
-        self.audit(
-            format!("tenant:{}", token_record.tenant_id),
-            "node.enroll",
-            format!("node:{node_id}"),
-            "success",
-            BTreeMap::from([
-                ("hostname".to_string(), request.hostname),
-                (
-                    "fingerprint".to_string(),
-                    identity_material.fingerprint.clone(),
-                ),
-            ]),
-        )
-        .await?;
-        Ok(Response::new(control::v1::EnrollNodeResponse {
-            identity: Some(control::v1::NodeIdentity {
-                node_id: Some(common::v1::NodeId { value: node_id }),
-                certificate_pem: identity_material.certificate_pem,
-                private_key_pem: identity_material.private_key_pem,
-                issued_at: Some(chrono_to_timestamp(identity_material.issued_at)),
-                expires_at: Some(chrono_to_timestamp(identity_material.expires_at)),
-            }),
-        }))
+        let span = rpc_server_span("control.enroll_node", &request);
+        async move {
+            let request = request.into_inner();
+            let token_record = self
+                .store
+                .consume_enrollment_token(&request.enrollment_token)
+                .await?
+                .ok_or_else(|| Status::unauthenticated("invalid or expired enrollment token"))?;
+            validate_signed_token(
+                &self.config.enrollment_secret,
+                &request.enrollment_token,
+                &token_record.tenant_id,
+                token_record.expires_at.timestamp(),
+                &token_record.allowed_roles,
+            )?;
+            let node_id = format!("node-{}", uuid::Uuid::new_v4());
+            let identity_material = issue_tls_identity(
+                &node_id,
+                &request.hostname,
+                &self.config.enrollment_secret,
+                chrono::Duration::days(30),
+            )?;
+            let identity = NodeIdentityRecord {
+                node_id: node_id.clone(),
+                tenant_id: token_record.tenant_id.clone(),
+                certificate_pem: identity_material.certificate_pem.clone(),
+                private_key_pem: identity_material.private_key_pem.clone(),
+                fingerprint: identity_material.fingerprint.clone(),
+                issued_at: identity_material.issued_at,
+                expires_at: identity_material.expires_at,
+                hostname: request.hostname.clone(),
+            };
+            self.store.save_node_identity(identity.clone()).await?;
+            self.audit(
+                format!("tenant:{}", token_record.tenant_id),
+                "node.enroll",
+                format!("node:{node_id}"),
+                "success",
+                BTreeMap::from([
+                    ("hostname".to_string(), request.hostname),
+                    (
+                        "fingerprint".to_string(),
+                        identity_material.fingerprint.clone(),
+                    ),
+                ]),
+            )
+            .await?;
+            Ok(Response::new(control::v1::EnrollNodeResponse {
+                identity: Some(control::v1::NodeIdentity {
+                    node_id: Some(common::v1::NodeId { value: node_id }),
+                    certificate_pem: identity_material.certificate_pem,
+                    private_key_pem: identity_material.private_key_pem,
+                    issued_at: Some(chrono_to_timestamp(identity_material.issued_at)),
+                    expires_at: Some(chrono_to_timestamp(identity_material.expires_at)),
+                }),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn authenticate(
         &self,
         request: Request<control::v1::AuthenticateRequest>,
     ) -> std::result::Result<Response<control::v1::AuthenticateResponse>, Status> {
-        let request = request.into_inner();
-        let auth = self
-            .authenticate_request(
-                request
-                    .credential
-                    .as_ref()
-                    .and_then(|credential| match credential {
-                        control::v1::authenticate_request::Credential::ApiKey(value) => {
-                            Some(value.clone())
+        let span = rpc_server_span("control.authenticate", &request);
+        async move {
+            let request = request.into_inner();
+            let auth = self
+                .authenticate_request(
+                    request
+                        .credential
+                        .as_ref()
+                        .and_then(|credential| match credential {
+                            control::v1::authenticate_request::Credential::ApiKey(value) => {
+                                Some(value.clone())
+                            }
+                            _ => None,
+                        }),
+                    request
+                        .credential
+                        .as_ref()
+                        .and_then(|credential| {
+                            match credential {
+                            control::v1::authenticate_request::Credential::CertificateFingerprint(
+                                value,
+                            ) => Some(value.clone()),
+                            _ => None,
                         }
-                        _ => None,
-                    }),
-                request
-                    .credential
-                    .as_ref()
-                    .and_then(|credential| match credential {
-                        control::v1::authenticate_request::Credential::CertificateFingerprint(
-                            value,
-                        ) => Some(value.clone()),
-                        _ => None,
-                    }),
+                        }),
+                )
+                .await?;
+            self.audit(
+                auth.actor.clone(),
+                "auth.authenticate",
+                format!("tenant:{}", auth.tenant_id),
+                "success",
+                BTreeMap::from([(
+                    "credential_kind".to_string(),
+                    credential_kind_label(&auth.credential_kind).to_string(),
+                )]),
             )
             .await?;
-        self.audit(
-            auth.actor.clone(),
-            "auth.authenticate",
-            format!("tenant:{}", auth.tenant_id),
-            "success",
-            BTreeMap::from([(
-                "credential_kind".to_string(),
-                match auth.credential_kind {
-                    CredentialKind::ApiKey => "api_key".to_string(),
-                    CredentialKind::CertificateFingerprint => "certificate".to_string(),
-                },
-            )]),
-        )
-        .await?;
-        Ok(Response::new(control::v1::AuthenticateResponse {
-            authenticated: true,
-            tenant_id: Some(common::v1::TenantId {
-                value: auth.tenant_id,
-            }),
-            scopes: auth.scopes,
-            expires_at: Some(chrono_to_timestamp(auth.expires_at)),
-        }))
+            Ok(Response::new(control::v1::AuthenticateResponse {
+                authenticated: true,
+                tenant_id: Some(common::v1::TenantId {
+                    value: auth.tenant_id.clone(),
+                }),
+                scopes: auth.scopes.clone(),
+                expires_at: Some(chrono_to_timestamp(auth.expires_at)),
+                policy: Some(control::v1::AuthPolicy {
+                    tenant_id: Some(common::v1::TenantId {
+                        value: auth.tenant_id,
+                    }),
+                    require_mtls: auth.require_mtls,
+                    max_requests_per_minute: auth.max_requests_per_minute,
+                    allowed_models: auth.allowed_models,
+                    allowed_node_pools: auth.allowed_node_pools,
+                }),
+                actor: auth.actor,
+                credential_kind: credential_kind_label(&auth.credential_kind).to_string(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -1333,10 +1473,7 @@ pub fn inject_auth_metadata<T>(request: &mut Request<T>, auth: &AuthContext) -> 
     metadata.insert(ACTOR_HEADER, parse_metadata_value(&auth.actor)?);
     metadata.insert(
         CREDENTIAL_KIND_HEADER,
-        parse_metadata_value(match auth.credential_kind {
-            CredentialKind::ApiKey => "api_key",
-            CredentialKind::CertificateFingerprint => "certificate",
-        })?,
+        parse_metadata_value(credential_kind_label(&auth.credential_kind))?,
     );
     Ok(())
 }
@@ -1360,6 +1497,13 @@ pub fn sha256_hex(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+fn credential_kind_label(kind: &CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::ApiKey => "api_key",
+        CredentialKind::CertificateFingerprint => "certificate",
+    }
 }
 
 fn validate_signed_token(
@@ -1506,6 +1650,7 @@ mod tests {
             scopes: vec!["inference:write".to_string()],
             expires_at: Utc::now() + chrono::Duration::minutes(5),
             require_mtls: false,
+            max_requests_per_minute: 120,
             allowed_models: vec!["mistral-small".to_string()],
             allowed_node_pools: vec![
                 "macos-metal-arm64".to_string(),

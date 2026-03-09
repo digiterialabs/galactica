@@ -86,10 +86,10 @@ proto-gen: proto-gen-rust proto-gen-python
 # === All ===
 
 # Build everything
-build-all: build py-install dash-build
+build-all: build py-install dash-install dash-build
 
 # Test everything
-test-all: test py-test
+test-all: test py-test dash-build
 
 # Lint everything
 lint-all: check py-lint dash-lint
@@ -105,6 +105,7 @@ fmt-check-all: fmt-check py-fmt-check
 # Install Husky and register local Git hooks
 precommit-install:
     npm install
+    npm --prefix dashboard install
 
 # Run the Husky pre-commit checks manually
 precommit-run:

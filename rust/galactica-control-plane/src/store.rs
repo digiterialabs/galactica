@@ -194,6 +194,7 @@ pub struct AuthContext {
     pub scopes: Vec<String>,
     pub expires_at: DateTime<Utc>,
     pub require_mtls: bool,
+    pub max_requests_per_minute: u32,
     pub allowed_models: Vec<String>,
     pub allowed_node_pools: Vec<String>,
     pub actor: String,

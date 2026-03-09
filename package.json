@@ -3,8 +3,8 @@
   "private": true,
   "scripts": {
     "prepare": "husky",
-    "hooks:pre-commit": "cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings",
-    "hooks:pre-push": "cargo test --workspace"
+    "hooks:pre-commit": "cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && npm --prefix dashboard run lint",
+    "hooks:pre-push": "cargo test --workspace && npm --prefix dashboard run build"
   },
   "devDependencies": {
     "husky": "^9.1.7"

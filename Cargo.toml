@@ -61,6 +61,11 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["trace", "grpc-tonic", "tls"] }
+prometheus-client = "0.22"
 
 # Networking
 libp2p = { version = "0.55", features = ["tokio", "mdns", "noise", "yamux", "tcp", "gossipsub", "identify"] }
@@ -71,6 +76,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 bytes = "1"
+http = "1"
 url = "2"
 sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream"] }

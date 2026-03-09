@@ -1,5 +1,11 @@
 // Galactica common types, errors, and proto-generated code.
 
+pub mod error;
+pub mod events;
+pub mod types;
+
+pub use error::{GalacticaError, Result};
+
 pub mod proto {
     pub mod common {
         pub mod v1 {

@@ -7,21 +7,20 @@
 Create and push a semver tag:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 That workflow builds native `galactica-cli` binaries for:
 
 - `aarch64-apple-darwin`
-- `x86_64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 - `x86_64-unknown-linux-gnu`
 
 It packages them into release assets named like:
 
-- `galactica-cli-v0.1.1-aarch64-apple-darwin.tar.gz`
-- `galactica-cli-v0.1.1-x86_64-pc-windows-msvc.zip`
+- `galactica-cli-v0.1.2-aarch64-apple-darwin.tar.gz`
+- `galactica-cli-v0.1.2-x86_64-pc-windows-msvc.zip`
 
 The publish job also uploads `SHA256SUMS.txt`.
 
@@ -36,3 +35,5 @@ It only uses the release asset when:
 - there is an asset matching the current host OS and CPU architecture
 
 If any of those checks fail, `self-install` falls back to `cargo install --path rust/galactica-cli`.
+
+At the moment, GitHub Releases publish assets for Apple Silicon macOS, Windows x64, and Linux x64. Intel macOS hosts still work, but `self-install` will fall back to `cargo install` because there is no x86_64 macOS release asset in this repo's workflow.

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish, for example v0.1.1"
+        description: "Release tag to publish, for example v0.1.2"
         required: true
         type: string
 
@@ -32,10 +32,6 @@ jobs:
             asset_ext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            binary_name: galactica-cli
-            asset_ext: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
             binary_name: galactica-cli
             asset_ext: tar.gz
           - os: windows-2022

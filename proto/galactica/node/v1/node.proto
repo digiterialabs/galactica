@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package galactica.node.v1;
+
+import "galactica/common/v1/common.proto";
+
+service NodeAgent {
+  rpc ExecuteTask(ExecuteTaskRequest) returns (ExecuteTaskResponse);
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+message ExecuteTaskRequest {
+  galactica.common.v1.TaskId task_id = 1;
+  galactica.common.v1.InstanceId instance_id = 2;
+  bytes payload = 3;
+}
+
+message ExecuteTaskResponse {
+  galactica.common.v1.TaskId task_id = 1;
+  galactica.common.v1.TaskStatus status = 2;
+  bytes result = 3;
+  string error_message = 4;
+}
+
+message LoadModelRequest {
+  galactica.common.v1.ModelId model_id = 1;
+  string variant_runtime = 2;
+  string variant_quantization = 3;
+  uint64 max_memory_bytes = 4;
+}
+
+message LoadModelResponse {
+  galactica.common.v1.InstanceId instance_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message UnloadModelRequest {
+  galactica.common.v1.InstanceId instance_id = 1;
+}
+
+message UnloadModelResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  galactica.common.v1.NodeStatus status = 1;
+  galactica.common.v1.NodeCapabilities capabilities = 2;
+  galactica.common.v1.Memory system_memory = 3;
+  repeated ModelInstance loaded_models = 4;
+}
+
+message ModelInstance {
+  galactica.common.v1.InstanceId instance_id = 1;
+  galactica.common.v1.ModelId model_id = 2;
+  string runtime = 3;
+  uint64 memory_used_bytes = 4;
+}

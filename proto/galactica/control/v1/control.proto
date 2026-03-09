@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package galactica.control.v1;
+
+import "google/protobuf/timestamp.proto";
+import "galactica/common/v1/common.proto";
+import "galactica/control/v1/auth.proto";
+
+service ControlPlane {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportCapabilities(ReportCapabilitiesRequest) returns (ReportCapabilitiesResponse);
+  rpc GetClusterState(GetClusterStateRequest) returns (GetClusterStateResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream galactica.common.v1.ClusterEvent);
+  rpc EnrollNode(EnrollNodeRequest) returns (EnrollNodeResponse);
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+}
+
+message RegisterNodeRequest {
+  string hostname = 1;
+  galactica.common.v1.NodeCapabilities capabilities = 2;
+  string version = 3;
+}
+
+message RegisterNodeResponse {
+  galactica.common.v1.NodeId node_id = 1;
+  google.protobuf.Timestamp registered_at = 2;
+}
+
+message HeartbeatRequest {
+  galactica.common.v1.NodeId node_id = 1;
+  galactica.common.v1.Memory system_memory = 2;
+  repeated AcceleratorUtilization accelerator_utilization = 3;
+  repeated RunningInstance running_instances = 4;
+}
+
+message AcceleratorUtilization {
+  uint32 index = 1;
+  float utilization_percent = 2;
+  galactica.common.v1.Memory vram = 3;
+}
+
+message RunningInstance {
+  galactica.common.v1.InstanceId instance_id = 1;
+  galactica.common.v1.ModelId model_id = 2;
+  uint64 memory_used_bytes = 3;
+}
+
+message HeartbeatResponse {
+  google.protobuf.Timestamp server_time = 1;
+  uint32 heartbeat_interval_seconds = 2;
+}
+
+message ReportCapabilitiesRequest {
+  galactica.common.v1.NodeId node_id = 1;
+  galactica.common.v1.NodeCapabilities capabilities = 2;
+}
+
+message ReportCapabilitiesResponse {}
+
+message GetClusterStateRequest {}
+
+message GetClusterStateResponse {
+  repeated galactica.common.v1.NodeInfo nodes = 1;
+  repeated LoadedModel loaded_models = 2;
+}
+
+message LoadedModel {
+  galactica.common.v1.InstanceId instance_id = 1;
+  galactica.common.v1.ModelId model_id = 2;
+  galactica.common.v1.NodeId node_id = 3;
+  string runtime = 4;
+}
+
+message WatchEventsRequest {
+  google.protobuf.Timestamp since = 1;
+}
+
+message EnrollNodeRequest {
+  string enrollment_token = 1;
+  string hostname = 2;
+  galactica.common.v1.NodeCapabilities capabilities = 3;
+}
+
+message EnrollNodeResponse {
+  NodeIdentity identity = 1;
+}
+
+message AuthenticateRequest {
+  oneof credential {
+    string api_key = 1;
+    string certificate_fingerprint = 2;
+  }
+}
+
+message AuthenticateResponse {
+  bool authenticated = 1;
+  galactica.common.v1.TenantId tenant_id = 2;
+  repeated string scopes = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}

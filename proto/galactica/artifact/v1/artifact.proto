@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package galactica.artifact.v1;
+
+import "galactica/common/v1/common.proto";
+
+service ArtifactService {
+  rpc GetModelManifest(GetModelManifestRequest) returns (GetModelManifestResponse);
+  rpc ListModels(ListArtifactModelsRequest) returns (ListArtifactModelsResponse);
+  rpc WatchDownload(WatchDownloadRequest) returns (stream DownloadProgress);
+}
+
+message GetModelManifestRequest {
+  galactica.common.v1.ModelId model_id = 1;
+}
+
+message GetModelManifestResponse {
+  galactica.common.v1.ModelManifest manifest = 1;
+}
+
+message ListArtifactModelsRequest {
+  string filter_runtime = 1;
+  string filter_family = 2;
+  uint32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListArtifactModelsResponse {
+  repeated galactica.common.v1.ModelManifest models = 1;
+  string next_page_token = 2;
+}
+
+message WatchDownloadRequest {
+  galactica.common.v1.ModelId model_id = 1;
+  string variant_runtime = 2;
+  string variant_quantization = 3;
+}
+
+message DownloadProgress {
+  galactica.common.v1.ModelId model_id = 1;
+  uint64 total_bytes = 2;
+  uint64 downloaded_bytes = 3;
+  float progress_percent = 4;
+  DownloadStatus status = 5;
+  string error_message = 6;
+}
+
+enum DownloadStatus {
+  DOWNLOAD_STATUS_UNSPECIFIED = 0;
+  DOWNLOAD_STATUS_QUEUED = 1;
+  DOWNLOAD_STATUS_DOWNLOADING = 2;
+  DOWNLOAD_STATUS_VERIFYING = 3;
+  DOWNLOAD_STATUS_COMPLETE = 4;
+  DOWNLOAD_STATUS_FAILED = 5;
+}

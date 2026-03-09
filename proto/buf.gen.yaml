@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/rust
+    out: ../rust/galactica-common/src/gen
+  - remote: buf.build/grpc/python
+    out: ../python/galactica_runtime/proto

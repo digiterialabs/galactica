@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+package galactica.runtime.v1;
+
+import "google/protobuf/timestamp.proto";
+import "galactica/common/v1/common.proto";
+
+service RuntimeBackend {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc ListModels(ListRuntimeModelsRequest) returns (ListRuntimeModelsResponse);
+  rpc EnsureModel(EnsureModelRequest) returns (EnsureModelResponse);
+  rpc LoadModel(LoadRuntimeModelRequest) returns (LoadRuntimeModelResponse);
+  rpc UnloadModel(UnloadRuntimeModelRequest) returns (UnloadRuntimeModelResponse);
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream RuntimeEvent);
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  string runtime_name = 1;
+  string runtime_version = 2;
+  repeated galactica.common.v1.AcceleratorType supported_accelerators = 3;
+  repeated string supported_quantizations = 4;
+  bool supports_embedding = 5;
+  bool supports_streaming = 6;
+  uint64 max_model_size_bytes = 7;
+}
+
+message ListRuntimeModelsRequest {}
+
+message ListRuntimeModelsResponse {
+  repeated RuntimeModelInfo models = 1;
+}
+
+message RuntimeModelInfo {
+  galactica.common.v1.InstanceId instance_id = 1;
+  galactica.common.v1.ModelId model_id = 2;
+  string quantization = 3;
+  uint64 memory_used_bytes = 4;
+  bool ready = 5;
+}
+
+message EnsureModelRequest {
+  galactica.common.v1.ModelManifest manifest = 1;
+  string variant_runtime = 2;
+  string variant_quantization = 3;
+}
+
+message EnsureModelResponse {
+  bool available = 1;
+  bool download_required = 2;
+  uint64 estimated_size_bytes = 3;
+}
+
+message LoadRuntimeModelRequest {
+  galactica.common.v1.ModelId model_id = 1;
+  string quantization = 2;
+  uint64 max_memory_bytes = 3;
+  map<string, string> runtime_options = 4;
+}
+
+message LoadRuntimeModelResponse {
+  galactica.common.v1.InstanceId instance_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  uint64 memory_used_bytes = 4;
+}
+
+message UnloadRuntimeModelRequest {
+  galactica.common.v1.InstanceId instance_id = 1;
+}
+
+message UnloadRuntimeModelResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message GenerateRequest {
+  galactica.common.v1.InstanceId instance_id = 1;
+  string prompt = 2;
+  GenerateParams params = 3;
+}
+
+message GenerateParams {
+  float temperature = 1;
+  float top_p = 2;
+  uint32 max_tokens = 3;
+  repeated string stop = 4;
+}
+
+message GenerateResponse {
+  string text = 1;
+  bool finished = 2;
+  string finish_reason = 3;
+  GenerateUsage usage = 4;
+}
+
+message GenerateUsage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  float tokens_per_second = 3;
+}
+
+message EmbedRequest {
+  galactica.common.v1.InstanceId instance_id = 1;
+  repeated string inputs = 2;
+}
+
+message EmbedResponse {
+  repeated Embedding embeddings = 1;
+  uint32 total_tokens = 2;
+}
+
+message Embedding {
+  repeated float values = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  RuntimeStatus status = 1;
+  string runtime_name = 2;
+  string runtime_version = 3;
+  uint64 uptime_seconds = 4;
+  uint32 loaded_model_count = 5;
+}
+
+enum RuntimeStatus {
+  RUNTIME_STATUS_UNSPECIFIED = 0;
+  RUNTIME_STATUS_HEALTHY = 1;
+  RUNTIME_STATUS_DEGRADED = 2;
+  RUNTIME_STATUS_UNHEALTHY = 3;
+}
+
+message StreamEventsRequest {}
+
+message RuntimeEvent {
+  string event_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  oneof event {
+    RuntimeModelLoadedEvent model_loaded = 3;
+    RuntimeModelUnloadedEvent model_unloaded = 4;
+    RuntimeErrorEvent error = 5;
+    RuntimeMemoryPressureEvent memory_pressure = 6;
+  }
+}
+
+message RuntimeModelLoadedEvent {
+  galactica.common.v1.InstanceId instance_id = 1;
+  galactica.common.v1.ModelId model_id = 2;
+  uint64 memory_used_bytes = 3;
+}
+
+message RuntimeModelUnloadedEvent {
+  galactica.common.v1.InstanceId instance_id = 1;
+}
+
+message RuntimeErrorEvent {
+  string message = 1;
+  string severity = 2;
+}
+
+message RuntimeMemoryPressureEvent {
+  uint64 available_bytes = 1;
+  uint64 total_bytes = 2;
+  float pressure_percent = 3;
+}

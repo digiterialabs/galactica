@@ -11,6 +11,8 @@ galactica-networking = { workspace = true }
 galactica-artifact = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
 sysinfo = { workspace = true }
 clap = { workspace = true }
 async-trait = { workspace = true }

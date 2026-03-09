@@ -17,6 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

@@ -38,7 +38,7 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PeerEvent {
     Discovered {
-        peer: PeerInfo,
+        peer: Box<PeerInfo>,
         source: DiscoverySource,
     },
     Expired {
@@ -95,7 +95,7 @@ impl PeerManager {
         drop(peers);
 
         let _ = self.events.send(PeerEvent::Discovered {
-            peer: merged.clone(),
+            peer: Box::new(merged.clone()),
             source,
         });
         merged
@@ -252,7 +252,7 @@ impl MdnsPeerAdvertisement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MdnsEvent {
-    Discovered(MdnsPeerAdvertisement),
+    Discovered(Box<MdnsPeerAdvertisement>),
     Expired { peer_id: PeerId },
 }
 
@@ -328,7 +328,7 @@ where
                 if advertisement.peer_id != self.local_advertisement.peer_id {
                     self.peer_manager
                         .upsert_peer(
-                            advertisement.to_peer_info(Utc::now()),
+                            advertisement.as_ref().to_peer_info(Utc::now()),
                             DiscoverySource::Mdns,
                         )
                         .await;
@@ -415,7 +415,7 @@ mod tests {
             peer_manager.clone(),
             VecMdnsEventSource {
                 events: VecDeque::from(vec![
-                    MdnsEvent::Discovered(MdnsPeerAdvertisement {
+                    MdnsEvent::Discovered(Box::new(MdnsPeerAdvertisement {
                         peer_id: control_plane_id,
                         addresses: vec![sample_addr(9090)],
                         hostname: "control-plane".to_string(),
@@ -423,8 +423,8 @@ mod tests {
                         control_plane_endpoint: Some("http://control-plane.local:9090".to_string()),
                         capabilities: None,
                         metadata: HashMap::from([("zone".to_string(), "lab".to_string())]),
-                    }),
-                    MdnsEvent::Discovered(MdnsPeerAdvertisement {
+                    })),
+                    MdnsEvent::Discovered(Box::new(MdnsPeerAdvertisement {
                         peer_id: worker_id,
                         addresses: vec![sample_addr(4200)],
                         hostname: "worker-01".to_string(),
@@ -432,7 +432,7 @@ mod tests {
                         control_plane_endpoint: None,
                         capabilities: None,
                         metadata: HashMap::new(),
-                    }),
+                    })),
                 ]),
             },
         );

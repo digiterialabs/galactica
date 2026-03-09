@@ -216,7 +216,7 @@ where
             os: self.probe.os_type() as i32,
             cpu_arch: self.probe.cpu_arch() as i32,
             accelerators: self.detect_accelerators(),
-            system_memory: Some(system_memory.clone()),
+            system_memory: Some(system_memory),
             network_profile: self.detect_network_profile() as i32,
             runtime_backends: self.detect_runtime_backends(),
             locality: self.detect_locality(hostname.clone()),

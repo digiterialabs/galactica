@@ -117,7 +117,7 @@ impl ModelRegistry for LocalModelRegistry {
             manifests.push(manifest);
         }
 
-        manifests.sort_by(|left, right| manifest_id(left).cmp(&manifest_id(right)));
+        manifests.sort_by_key(manifest_id);
         Ok(manifests)
     }
 }

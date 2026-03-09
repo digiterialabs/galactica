@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, GalacticaError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GalacticaError {
+    Unauthorized(String),
     NotFound(String),
     InvalidArgument(String),
     Unavailable(String),
@@ -16,6 +17,10 @@ pub enum GalacticaError {
 impl GalacticaError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::Unauthorized(message.into())
     }
 
     pub fn invalid_argument(message: impl Into<String>) -> Self {
@@ -36,6 +41,7 @@ impl GalacticaError {
 
     pub fn code(&self) -> Code {
         match self {
+            Self::Unauthorized(_) => Code::Unauthenticated,
             Self::NotFound(_) => Code::NotFound,
             Self::InvalidArgument(_) => Code::InvalidArgument,
             Self::Unavailable(_) => Code::Unavailable,
@@ -46,7 +52,8 @@ impl GalacticaError {
 
     pub fn message(&self) -> &str {
         match self {
-            Self::NotFound(message)
+            Self::Unauthorized(message)
+            | Self::NotFound(message)
             | Self::InvalidArgument(message)
             | Self::Unavailable(message)
             | Self::FailedPrecondition(message)

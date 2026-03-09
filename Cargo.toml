@@ -39,7 +39,7 @@ async-trait = "0.1"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # gRPC / Protobuf
-tonic = "0.13"
+tonic = { version = "0.13", features = ["tls-ring"] }
 tonic-build = "0.13"
 prost = "0.13"
 prost-types = "0.13"
@@ -56,7 +56,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
 
 # Observability
 tracing = "0.1"
@@ -76,6 +76,7 @@ sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 clap = { version = "4", features = ["derive"] }
 sysinfo = "0.34"
+rcgen = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -141,15 +141,15 @@ impl LocalCache {
         let mut entries = self.entries.lock().await;
         let removed = entries.remove(&key.cache_id());
         drop(entries);
-        if let Some(removed) = removed.clone() {
-            if removed.path.exists() {
-                fs::remove_file(&removed.path).map_err(|error| {
-                    GalacticaError::internal(format!(
-                        "failed to remove cache entry {}: {error}",
-                        removed.path.display()
-                    ))
-                })?;
-            }
+        if let Some(removed) = removed.clone()
+            && removed.path.exists()
+        {
+            fs::remove_file(&removed.path).map_err(|error| {
+                GalacticaError::internal(format!(
+                    "failed to remove cache entry {}: {error}",
+                    removed.path.display()
+                ))
+            })?;
         }
         Ok(removed)
     }

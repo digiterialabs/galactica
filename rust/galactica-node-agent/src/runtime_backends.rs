@@ -815,7 +815,7 @@ impl OnnxBackend {
                 instance_prefix: "onnx".to_string(),
                 synthetic_prefix: "ONNX Runtime".to_string(),
                 process_config: config.process,
-                min_memory_bytes: 1 * 1024 * 1024 * 1024,
+                min_memory_bytes: 1024 * 1024 * 1024,
                 max_memory_bytes: 48 * 1024 * 1024 * 1024,
                 default_runtime_options: HashMap::from([(
                     "execution_provider".to_string(),

@@ -3,19 +3,18 @@ pub mod planner;
 pub mod runtime_backends;
 pub mod supervision;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
-use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::Stream;
-use galactica_common::inference::{NodeExecutionPayload, estimate_tokens};
+use galactica_common::Result;
+use galactica_common::inference::NodeExecutionPayload;
 use galactica_common::proto::{common, node, runtime};
-use galactica_common::{GalacticaError, Result, chrono_to_timestamp};
-use tokio::sync::{RwLock, broadcast};
+use galactica_observability::set_parent_from_tonic_request;
 use tonic::{Request, Response, Status};
+use tracing::{Instrument, info_span};
 
 pub use hardware::{
     AcceleratorHint, DefaultHardwareDetector, HardwareMonitor, HardwareProbe, HardwareSample,
@@ -30,8 +29,8 @@ pub use runtime::v1::runtime_backend_server::{
     RuntimeBackend as RuntimeBackendGrpc, RuntimeBackendServer,
 };
 pub use runtime_backends::{
-    LlamaCppBackend, LlamaCppBackendConfig, OnnxBackend, OnnxBackendConfig, VllmBackend,
-    VllmBackendConfig,
+    LlamaCppBackend, LlamaCppBackendConfig, MlxBackend, MlxBackendConfig, OnnxBackend,
+    OnnxBackendConfig, VllmBackend, VllmBackendConfig,
 };
 pub use supervision::{
     DefaultProcessSupervisor, RuntimeHandle, RuntimeHealth, RuntimeLifecycle,
@@ -42,6 +41,12 @@ type GenerateStream =
     Pin<Box<dyn Stream<Item = std::result::Result<runtime::v1::GenerateResponse, Status>> + Send>>;
 type EventStream =
     Pin<Box<dyn Stream<Item = std::result::Result<runtime::v1::RuntimeEvent, Status>> + Send>>;
+
+fn rpc_server_span<T>(name: &'static str, request: &Request<T>) -> tracing::Span {
+    let span = info_span!("rpc.server", rpc.method = %name, otel.kind = "server");
+    set_parent_from_tonic_request(&span, request);
+    span
+}
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
@@ -66,297 +71,6 @@ pub trait RuntimeBackend: Send + Sync {
     -> Result<runtime::v1::EmbedResponse>;
     async fn health(&self) -> Result<runtime::v1::HealthResponse>;
     async fn stream_events(&self) -> Result<EventStream>;
-}
-
-#[derive(Debug, Clone)]
-struct LoadedInstance {
-    instance_id: String,
-    model_id: String,
-    quantization: String,
-    memory_used_bytes: u64,
-    ready: bool,
-}
-
-#[derive(Clone)]
-pub struct MlxBackend {
-    started_at: Instant,
-    loaded_models: Arc<RwLock<BTreeMap<String, LoadedInstance>>>,
-    event_sender: broadcast::Sender<runtime::v1::RuntimeEvent>,
-}
-
-impl Default for MlxBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MlxBackend {
-    pub fn new() -> Self {
-        let (event_sender, _) = broadcast::channel(64);
-        Self {
-            started_at: Instant::now(),
-            loaded_models: Arc::new(RwLock::new(BTreeMap::new())),
-            event_sender,
-        }
-    }
-
-    fn supports_variant(runtime: &str) -> bool {
-        runtime.eq_ignore_ascii_case("mlx")
-    }
-
-    fn synthetic_completion(prompt: &str) -> String {
-        let last_line = prompt.lines().last().unwrap_or(prompt).trim();
-        format!("MLX synthesized response for {last_line}")
-    }
-}
-
-#[async_trait]
-impl RuntimeBackend for MlxBackend {
-    async fn get_capabilities(&self) -> Result<runtime::v1::GetCapabilitiesResponse> {
-        Ok(runtime::v1::GetCapabilitiesResponse {
-            runtime_name: "mlx".to_string(),
-            runtime_version: "simulated-1.0".to_string(),
-            supported_accelerators: vec![common::v1::AcceleratorType::Metal as i32],
-            supported_quantizations: vec![
-                "4bit".to_string(),
-                "8bit".to_string(),
-                "fp16".to_string(),
-            ],
-            supports_embedding: true,
-            supports_streaming: true,
-            max_model_size_bytes: 32 * 1024 * 1024 * 1024,
-        })
-    }
-
-    async fn list_models(&self) -> Result<Vec<runtime::v1::RuntimeModelInfo>> {
-        let models = self.loaded_models.read().await;
-        Ok(models
-            .values()
-            .map(|instance| runtime::v1::RuntimeModelInfo {
-                instance_id: Some(common::v1::InstanceId {
-                    value: instance.instance_id.clone(),
-                }),
-                model_id: Some(common::v1::ModelId {
-                    value: instance.model_id.clone(),
-                }),
-                quantization: instance.quantization.clone(),
-                memory_used_bytes: instance.memory_used_bytes,
-                ready: instance.ready,
-            })
-            .collect())
-    }
-
-    async fn ensure_model(
-        &self,
-        manifest: common::v1::ModelManifest,
-        variant_runtime: String,
-        variant_quantization: String,
-    ) -> Result<runtime::v1::EnsureModelResponse> {
-        let variant = manifest
-            .variants
-            .iter()
-            .find(|candidate| {
-                candidate.runtime.eq_ignore_ascii_case(&variant_runtime)
-                    && (variant_quantization.is_empty()
-                        || candidate.quantization == variant_quantization)
-            })
-            .ok_or_else(|| {
-                GalacticaError::failed_precondition(format!(
-                    "no MLX variant available for {}",
-                    manifest
-                        .model_id
-                        .as_ref()
-                        .map(|model_id| model_id.value.as_str())
-                        .unwrap_or("unknown")
-                ))
-            })?;
-        if !Self::supports_variant(&variant.runtime) {
-            return Err(GalacticaError::failed_precondition(format!(
-                "runtime {} is not supported by the MLX backend",
-                variant.runtime
-            )));
-        }
-
-        Ok(runtime::v1::EnsureModelResponse {
-            available: true,
-            download_required: false,
-            estimated_size_bytes: variant.size_bytes,
-        })
-    }
-
-    async fn load_model(
-        &self,
-        request: runtime::v1::LoadRuntimeModelRequest,
-    ) -> Result<runtime::v1::LoadRuntimeModelResponse> {
-        let model_id = request
-            .model_id
-            .as_ref()
-            .map(|model_id| model_id.value.clone())
-            .ok_or_else(|| GalacticaError::invalid_argument("model_id is required"))?;
-        let instance_id = format!("mlx-{}", uuid::Uuid::new_v4());
-        let memory_used_bytes = request
-            .max_memory_bytes
-            .clamp(512 * 1024 * 1024, 6 * 1024 * 1024 * 1024);
-
-        self.loaded_models.write().await.insert(
-            instance_id.clone(),
-            LoadedInstance {
-                instance_id: instance_id.clone(),
-                model_id: model_id.clone(),
-                quantization: request.quantization.clone(),
-                memory_used_bytes,
-                ready: true,
-            },
-        );
-        let _ = self.event_sender.send(runtime::v1::RuntimeEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            timestamp: Some(chrono_to_timestamp(chrono::Utc::now())),
-            event: Some(runtime::v1::runtime_event::Event::ModelLoaded(
-                runtime::v1::RuntimeModelLoadedEvent {
-                    instance_id: Some(common::v1::InstanceId {
-                        value: instance_id.clone(),
-                    }),
-                    model_id: Some(common::v1::ModelId { value: model_id }),
-                    memory_used_bytes,
-                },
-            )),
-        });
-
-        Ok(runtime::v1::LoadRuntimeModelResponse {
-            instance_id: Some(common::v1::InstanceId { value: instance_id }),
-            success: true,
-            error_message: String::new(),
-            memory_used_bytes,
-        })
-    }
-
-    async fn unload_model(
-        &self,
-        request: runtime::v1::UnloadRuntimeModelRequest,
-    ) -> Result<runtime::v1::UnloadRuntimeModelResponse> {
-        let instance_id = request
-            .instance_id
-            .as_ref()
-            .map(|instance_id| instance_id.value.clone())
-            .ok_or_else(|| GalacticaError::invalid_argument("instance_id is required"))?;
-        let removed = self.loaded_models.write().await.remove(&instance_id);
-        if removed.is_none() {
-            return Err(GalacticaError::not_found(format!(
-                "loaded model not found: {instance_id}"
-            )));
-        }
-        let _ = self.event_sender.send(runtime::v1::RuntimeEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            timestamp: Some(chrono_to_timestamp(chrono::Utc::now())),
-            event: Some(runtime::v1::runtime_event::Event::ModelUnloaded(
-                runtime::v1::RuntimeModelUnloadedEvent {
-                    instance_id: Some(common::v1::InstanceId { value: instance_id }),
-                },
-            )),
-        });
-
-        Ok(runtime::v1::UnloadRuntimeModelResponse {
-            success: true,
-            error_message: String::new(),
-        })
-    }
-
-    async fn generate(&self, request: runtime::v1::GenerateRequest) -> Result<GenerateStream> {
-        let instance_id = request
-            .instance_id
-            .as_ref()
-            .map(|instance_id| instance_id.value.clone())
-            .ok_or_else(|| GalacticaError::invalid_argument("instance_id is required"))?;
-        if !self.loaded_models.read().await.contains_key(&instance_id) {
-            return Err(GalacticaError::not_found(format!(
-                "loaded model not found: {instance_id}"
-            )));
-        }
-
-        let completion = Self::synthetic_completion(&request.prompt);
-        let prompt_tokens = estimate_tokens(&request.prompt);
-        let completion_tokens = estimate_tokens(&completion);
-
-        let stream = try_stream! {
-            let words: Vec<&str> = completion.split_whitespace().collect();
-            for (index, word) in words.iter().enumerate() {
-                let finished = index + 1 == words.len();
-                yield runtime::v1::GenerateResponse {
-                    text: if finished {
-                        (*word).to_string()
-                    } else {
-                        format!("{word} ")
-                    },
-                    finished,
-                    finish_reason: if finished { "stop".to_string() } else { String::new() },
-                    usage: Some(runtime::v1::GenerateUsage {
-                        prompt_tokens,
-                        completion_tokens,
-                        tokens_per_second: 32.0,
-                    }),
-                };
-            }
-        };
-
-        Ok(Box::pin(stream) as GenerateStream)
-    }
-
-    async fn embed(
-        &self,
-        request: runtime::v1::EmbedRequest,
-    ) -> Result<runtime::v1::EmbedResponse> {
-        let _instance_id = request
-            .instance_id
-            .as_ref()
-            .map(|instance_id| instance_id.value.clone())
-            .ok_or_else(|| GalacticaError::invalid_argument("instance_id is required"))?;
-        let embeddings = request
-            .inputs
-            .iter()
-            .map(|input| runtime::v1::Embedding {
-                values: vec![
-                    input.len() as f32,
-                    input.bytes().map(f32::from).sum::<f32>(),
-                    estimate_tokens(input) as f32,
-                ],
-            })
-            .collect::<Vec<_>>();
-
-        Ok(runtime::v1::EmbedResponse {
-            embeddings,
-            total_tokens: request
-                .inputs
-                .iter()
-                .map(|input| estimate_tokens(input))
-                .sum(),
-        })
-    }
-
-    async fn health(&self) -> Result<runtime::v1::HealthResponse> {
-        let model_count = self.loaded_models.read().await.len() as u32;
-        Ok(runtime::v1::HealthResponse {
-            status: runtime::v1::RuntimeStatus::Healthy as i32,
-            runtime_name: "mlx".to_string(),
-            runtime_version: "simulated-1.0".to_string(),
-            uptime_seconds: self.started_at.elapsed().as_secs(),
-            loaded_model_count: model_count,
-        })
-    }
-
-    async fn stream_events(&self) -> Result<EventStream> {
-        let mut receiver = self.event_sender.subscribe();
-        let stream = try_stream! {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => yield event,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        };
-
-        Ok(Box::pin(stream) as EventStream)
-    }
 }
 
 #[derive(Clone)]
@@ -465,13 +179,13 @@ where
 }
 
 #[derive(Clone)]
-pub struct NodeAgentService<B> {
+pub struct NodeAgentService<B: ?Sized> {
     backend: Arc<B>,
     capabilities: common::v1::NodeCapabilities,
     system_memory: common::v1::Memory,
 }
 
-impl<B> NodeAgentService<B> {
+impl<B: ?Sized> NodeAgentService<B> {
     pub fn new(
         backend: Arc<B>,
         capabilities: common::v1::NodeCapabilities,
@@ -488,105 +202,128 @@ impl<B> NodeAgentService<B> {
 #[tonic::async_trait]
 impl<B> NodeAgent for NodeAgentService<B>
 where
-    B: RuntimeBackend + 'static,
+    B: RuntimeBackend + 'static + ?Sized,
 {
     async fn execute_task(
         &self,
         request: Request<node::v1::ExecuteTaskRequest>,
     ) -> std::result::Result<Response<node::v1::ExecuteTaskResponse>, Status> {
-        let request = request.into_inner();
-        let payload: NodeExecutionPayload = serde_json::from_slice(&request.payload)
-            .map_err(|error| Status::invalid_argument(format!("invalid task payload: {error}")))?;
-        let generate_request = runtime::v1::GenerateRequest {
-            instance_id: request.instance_id.clone(),
-            prompt: payload.prompt,
-            params: Some(runtime::v1::GenerateParams {
-                temperature: payload.params.temperature,
-                top_p: payload.params.top_p,
-                max_tokens: payload.params.max_tokens,
-                stop: payload.params.stop,
-            }),
-        };
-        let mut stream = self.backend.generate(generate_request).await?;
-        let mut output = String::new();
-        while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
-            let chunk = chunk?;
-            output.push_str(&chunk.text);
-        }
+        let span = rpc_server_span("node_agent.execute_task", &request);
+        async move {
+            let request = request.into_inner();
+            let payload: NodeExecutionPayload =
+                serde_json::from_slice(&request.payload).map_err(|error| {
+                    Status::invalid_argument(format!("invalid task payload: {error}"))
+                })?;
+            let generate_request = runtime::v1::GenerateRequest {
+                instance_id: request.instance_id.clone(),
+                prompt: payload.prompt,
+                params: Some(runtime::v1::GenerateParams {
+                    temperature: payload.params.temperature,
+                    top_p: payload.params.top_p,
+                    max_tokens: payload.params.max_tokens,
+                    stop: payload.params.stop,
+                }),
+            };
+            let mut stream = self.backend.generate(generate_request).await?;
+            let mut output = String::new();
+            while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+                let chunk = chunk?;
+                output.push_str(&chunk.text);
+            }
 
-        Ok(Response::new(node::v1::ExecuteTaskResponse {
-            task_id: request.task_id,
-            status: common::v1::TaskStatus::Completed as i32,
-            result: output.into_bytes(),
-            error_message: String::new(),
-        }))
+            Ok(Response::new(node::v1::ExecuteTaskResponse {
+                task_id: request.task_id,
+                status: common::v1::TaskStatus::Completed as i32,
+                result: output.into_bytes(),
+                error_message: String::new(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn load_model(
         &self,
         request: Request<node::v1::LoadModelRequest>,
     ) -> std::result::Result<Response<node::v1::LoadModelResponse>, Status> {
-        let request = request.into_inner();
-        let response = self
-            .backend
-            .load_model(runtime::v1::LoadRuntimeModelRequest {
-                model_id: request.model_id,
-                quantization: request.variant_quantization,
-                max_memory_bytes: request.max_memory_bytes,
-                runtime_options: HashMap::from([(
-                    "variant_runtime".to_string(),
-                    request.variant_runtime,
-                )]),
-            })
-            .await?;
+        let span = rpc_server_span("node_agent.load_model", &request);
+        async move {
+            let request = request.into_inner();
+            let response = self
+                .backend
+                .load_model(runtime::v1::LoadRuntimeModelRequest {
+                    model_id: request.model_id,
+                    quantization: request.variant_quantization,
+                    max_memory_bytes: request.max_memory_bytes,
+                    runtime_options: HashMap::from([(
+                        "variant_runtime".to_string(),
+                        request.variant_runtime,
+                    )]),
+                })
+                .await?;
 
-        Ok(Response::new(node::v1::LoadModelResponse {
-            instance_id: response.instance_id,
-            success: response.success,
-            error_message: response.error_message,
-        }))
+            Ok(Response::new(node::v1::LoadModelResponse {
+                instance_id: response.instance_id,
+                success: response.success,
+                error_message: response.error_message,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn unload_model(
         &self,
         request: Request<node::v1::UnloadModelRequest>,
     ) -> std::result::Result<Response<node::v1::UnloadModelResponse>, Status> {
-        let response = self
-            .backend
-            .unload_model(runtime::v1::UnloadRuntimeModelRequest {
-                instance_id: request.into_inner().instance_id,
-            })
-            .await?;
+        let span = rpc_server_span("node_agent.unload_model", &request);
+        async move {
+            let response = self
+                .backend
+                .unload_model(runtime::v1::UnloadRuntimeModelRequest {
+                    instance_id: request.into_inner().instance_id,
+                })
+                .await?;
 
-        Ok(Response::new(node::v1::UnloadModelResponse {
-            success: response.success,
-            error_message: response.error_message,
-        }))
+            Ok(Response::new(node::v1::UnloadModelResponse {
+                success: response.success,
+                error_message: response.error_message,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_status(
         &self,
-        _request: Request<node::v1::GetStatusRequest>,
+        request: Request<node::v1::GetStatusRequest>,
     ) -> std::result::Result<Response<node::v1::GetStatusResponse>, Status> {
-        let loaded_models = self
-            .backend
-            .list_models()
-            .await?
-            .into_iter()
-            .map(|model| node::v1::ModelInstance {
-                instance_id: model.instance_id,
-                model_id: model.model_id,
-                runtime: "mlx".to_string(),
-                memory_used_bytes: model.memory_used_bytes,
-            })
-            .collect();
+        let span = rpc_server_span("node_agent.get_status", &request);
+        async move {
+            let runtime_name = self.backend.get_capabilities().await?.runtime_name;
+            let loaded_models = self
+                .backend
+                .list_models()
+                .await?
+                .into_iter()
+                .map(|model| node::v1::ModelInstance {
+                    instance_id: model.instance_id,
+                    model_id: model.model_id,
+                    runtime: runtime_name.clone(),
+                    memory_used_bytes: model.memory_used_bytes,
+                })
+                .collect();
 
-        Ok(Response::new(node::v1::GetStatusResponse {
-            status: common::v1::NodeStatus::Online as i32,
-            capabilities: Some(self.capabilities.clone()),
-            system_memory: Some(self.system_memory),
-            loaded_models,
-        }))
+            Ok(Response::new(node::v1::GetStatusResponse {
+                status: common::v1::NodeStatus::Online as i32,
+                capabilities: Some(self.capabilities.clone()),
+                system_memory: Some(self.system_memory),
+                loaded_models,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 }
 

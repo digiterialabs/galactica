@@ -8,6 +8,13 @@ license.workspace = true
 galactica-common = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+prometheus-client = { workspace = true }
+tonic = { workspace = true }
+http = { workspace = true }
 
 [lints]
 workspace = true

@@ -12,6 +12,8 @@ service ControlPlane {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportCapabilities(ReportCapabilitiesRequest) returns (ReportCapabilitiesResponse);
   rpc GetClusterState(GetClusterStateRequest) returns (GetClusterStateResponse);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc ListAuditRecords(ListAuditRecordsRequest) returns (ListAuditRecordsResponse);
   rpc ListAvailableModels(ListAvailableModelsRequest) returns (ListAvailableModelsResponse);
   rpc Infer(InferRequest) returns (stream InferChunk);
   rpc WatchEvents(WatchEventsRequest) returns (stream galactica.common.v1.ClusterEvent);
@@ -69,6 +71,20 @@ message GetClusterStateResponse {
   repeated LoadedModel loaded_models = 2;
 }
 
+message ListEventsRequest {
+  uint64 since_sequence = 1;
+}
+
+message SequencedClusterEvent {
+  uint64 sequence = 1;
+  galactica.common.v1.ClusterEvent event = 2;
+}
+
+message ListEventsResponse {
+  repeated SequencedClusterEvent events = 1;
+  uint64 last_sequence = 2;
+}
+
 message ListAvailableModelsRequest {
   string filter_runtime = 1;
 }
@@ -100,6 +116,25 @@ message LoadedModel {
   string runtime = 4;
 }
 
+message ListAuditRecordsRequest {
+  google.protobuf.Timestamp since = 1;
+  uint32 limit = 2;
+}
+
+message AuditRecord {
+  string event_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string actor = 3;
+  string action = 4;
+  string resource = 5;
+  string outcome = 6;
+  map<string, string> details = 7;
+}
+
+message ListAuditRecordsResponse {
+  repeated AuditRecord records = 1;
+}
+
 message WatchEventsRequest {
   google.protobuf.Timestamp since = 1;
 }
@@ -126,4 +161,7 @@ message AuthenticateResponse {
   galactica.common.v1.TenantId tenant_id = 2;
   repeated string scopes = 3;
   google.protobuf.Timestamp expires_at = 4;
+  AuthPolicy policy = 5;
+  string actor = 6;
+  string credential_kind = 7;
 }

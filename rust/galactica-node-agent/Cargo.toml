@@ -21,6 +21,10 @@ async-stream = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

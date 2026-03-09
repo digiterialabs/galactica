@@ -1,5 +1,6 @@
 pub mod hardware;
 pub mod planner;
+pub mod runtime_backends;
 pub mod supervision;
 
 use std::collections::{BTreeMap, HashMap};
@@ -27,6 +28,10 @@ pub use planner::{
 };
 pub use runtime::v1::runtime_backend_server::{
     RuntimeBackend as RuntimeBackendGrpc, RuntimeBackendServer,
+};
+pub use runtime_backends::{
+    LlamaCppBackend, LlamaCppBackendConfig, OnnxBackend, OnnxBackendConfig, VllmBackend,
+    VllmBackendConfig,
 };
 pub use supervision::{
     DefaultProcessSupervisor, RuntimeHandle, RuntimeHealth, RuntimeLifecycle,

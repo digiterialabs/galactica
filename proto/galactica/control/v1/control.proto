@@ -5,12 +5,15 @@ package galactica.control.v1;
 import "google/protobuf/timestamp.proto";
 import "galactica/common/v1/common.proto";
 import "galactica/control/v1/auth.proto";
+import "galactica/gateway/v1/gateway.proto";
 
 service ControlPlane {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportCapabilities(ReportCapabilitiesRequest) returns (ReportCapabilitiesResponse);
   rpc GetClusterState(GetClusterStateRequest) returns (GetClusterStateResponse);
+  rpc ListAvailableModels(ListAvailableModelsRequest) returns (ListAvailableModelsResponse);
+  rpc Infer(InferRequest) returns (stream InferChunk);
   rpc WatchEvents(WatchEventsRequest) returns (stream galactica.common.v1.ClusterEvent);
   rpc EnrollNode(EnrollNodeRequest) returns (EnrollNodeResponse);
   rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
@@ -20,6 +23,7 @@ message RegisterNodeRequest {
   string hostname = 1;
   galactica.common.v1.NodeCapabilities capabilities = 2;
   string version = 3;
+  string agent_endpoint = 4;
 }
 
 message RegisterNodeResponse {
@@ -63,6 +67,30 @@ message GetClusterStateRequest {}
 message GetClusterStateResponse {
   repeated galactica.common.v1.NodeInfo nodes = 1;
   repeated LoadedModel loaded_models = 2;
+}
+
+message ListAvailableModelsRequest {
+  string filter_runtime = 1;
+}
+
+message ListAvailableModelsResponse {
+  repeated galactica.common.v1.ModelManifest models = 1;
+}
+
+message InferRequest {
+  string request_id = 1;
+  string model = 2;
+  repeated galactica.gateway.v1.ChatMessage messages = 3;
+  galactica.gateway.v1.InferenceParams params = 4;
+}
+
+message InferChunk {
+  string request_id = 1;
+  string model = 2;
+  uint32 choice_index = 3;
+  string delta_content = 4;
+  string finish_reason = 5;
+  galactica.gateway.v1.Usage usage = 6;
 }
 
 message LoadedModel {

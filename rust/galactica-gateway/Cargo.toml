@@ -17,6 +17,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+galactica-artifact = { path = "../galactica-artifact" }
+galactica-node-agent = { path = "../galactica-node-agent" }
+tokio-stream = { workspace = true }

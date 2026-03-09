@@ -14,6 +14,9 @@ tonic = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
+prost = { workspace = true }
+sqlx = { workspace = true }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

@@ -74,6 +74,7 @@ url = "2"
 sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 clap = { version = "4", features = ["derive"] }
+tokio-stream = "0.1"
 sysinfo = "0.34"
 
 [workspace.lints.rust]

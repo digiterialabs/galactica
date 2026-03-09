@@ -1,3 +1,7 @@
+pub mod hardware;
+pub mod planner;
+pub mod supervision;
+
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,9 +16,21 @@ use galactica_common::{GalacticaError, Result, chrono_to_timestamp};
 use tokio::sync::{RwLock, broadcast};
 use tonic::{Request, Response, Status};
 
+pub use hardware::{
+    AcceleratorHint, DefaultHardwareDetector, HardwareMonitor, HardwareProbe, HardwareSample,
+    HardwareSnapshot, SystemHardwareProbe,
+};
 pub use node::v1::node_agent_server::{NodeAgent, NodeAgentServer};
+pub use planner::{
+    DesiredModelState, DesiredNodeState, DesiredTaskAssignment, NodeAgentRunner, ObservedNodeState,
+    PlanAction, PlanContext, download, execute, load, plan, shutdown_orphaned, start_needed,
+};
 pub use runtime::v1::runtime_backend_server::{
     RuntimeBackend as RuntimeBackendGrpc, RuntimeBackendServer,
+};
+pub use supervision::{
+    DefaultProcessSupervisor, RuntimeHandle, RuntimeHealth, RuntimeLifecycle,
+    RuntimeLifecycleState, RuntimeProcessConfig,
 };
 
 type GenerateStream =

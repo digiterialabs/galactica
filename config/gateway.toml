@@ -1,0 +1,25 @@
+# Galactica Gateway Configuration
+
+[http]
+listen_addr = "0.0.0.0:8080"
+
+[grpc]
+listen_addr = "0.0.0.0:8081"
+
+[upstream]
+control_plane_addr = "http://localhost:9090"
+
+[auth]
+enabled = false
+# api_key_header = "Authorization"
+
+[rate_limit]
+enabled = false
+max_requests_per_minute = 60
+
+[cors]
+allowed_origins = ["*"]
+
+[logging]
+level = "info"
+format = "text"

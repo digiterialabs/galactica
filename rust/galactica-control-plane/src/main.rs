@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long)]
     enrollment_token_ttl_seconds: Option<u64>,
 
+    /// Mint a bootstrap enrollment token and exit without serving
+    #[arg(long)]
+    mint_enrollment_token_only: bool,
+
     /// Path to configuration file
     #[arg(long, short)]
     config: Option<PathBuf>,
@@ -89,6 +93,7 @@ struct FileConfig {
     require_mtls: Option<bool>,
     print_enrollment_token: Option<bool>,
     enrollment_token_ttl_seconds: Option<u64>,
+    mint_enrollment_token_only: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -105,6 +110,7 @@ struct EffectiveConfig {
     require_mtls: bool,
     print_enrollment_token: bool,
     enrollment_token_ttl_seconds: u64,
+    mint_enrollment_token_only: bool,
 }
 
 #[tokio::main]
@@ -113,7 +119,11 @@ async fn main() -> Result<()> {
     let file_config = load_config(cli.config.as_deref())?;
     let config = EffectiveConfig::from_sources(cli, file_config);
 
-    let _tracing = init_tracing("galactica-control-plane");
+    let _tracing = if config.mint_enrollment_token_only {
+        None
+    } else {
+        Some(init_tracing("galactica-control-plane"))
+    };
 
     if let Some(parent) = config.state_db_path.parent()
         && !parent.as_os_str().is_empty()
@@ -164,6 +174,18 @@ async fn main() -> Result<()> {
         })
         .await
         .context("failed to seed bootstrap tenant")?;
+    if config.mint_enrollment_token_only {
+        let token = service
+            .mint_enrollment_token(
+                &config.tenant_id,
+                vec!["worker".to_string()],
+                Duration::from_secs(config.enrollment_token_ttl_seconds),
+            )
+            .await
+            .context("failed to mint bootstrap enrollment token")?;
+        println!("{token}");
+        return Ok(());
+    }
     if config.print_enrollment_token {
         let token = service
             .mint_enrollment_token(
@@ -246,6 +268,11 @@ impl EffectiveConfig {
                 .enrollment_token_ttl_seconds
                 .or(file.enrollment_token_ttl_seconds)
                 .unwrap_or(3600),
+            mint_enrollment_token_only: if cli.mint_enrollment_token_only {
+                true
+            } else {
+                file.mint_enrollment_token_only.unwrap_or(false)
+            },
         }
     }
 }

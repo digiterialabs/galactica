@@ -262,21 +262,30 @@ impl Scheduler {
         &self,
         pools: &BTreeMap<String, Vec<(NodeRecord, common::v1::ModelVariant)>>,
     ) -> Result<PlacementDecision> {
-        let pool_name =
-            pools.keys().next().cloned().ok_or_else(|| {
-                GalacticaError::failed_precondition("no execution pools available")
-            })?;
+        let selection_key = pools.keys().cloned().collect::<Vec<_>>().join("|");
         let entries = pools
-            .get(&pool_name)
-            .ok_or_else(|| GalacticaError::failed_precondition("selected pool was empty"))?;
+            .iter()
+            .flat_map(|(pool, entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|(node, variant)| (pool.clone(), node, variant))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Err(GalacticaError::failed_precondition(
+                "no execution pools available",
+            ));
+        }
         let mut cursors = self.cursors.lock().await;
-        let cursor = cursors.entry(pool_name.clone()).or_insert(0);
+        let cursor = cursors.entry(selection_key).or_insert(0);
         let selected = entries[*cursor % entries.len()].clone();
         *cursor = (*cursor + 1) % entries.len();
         Ok(PlacementDecision {
-            pool: pool_name,
-            node: selected.0,
-            variant: selected.1,
+            pool: selected.0,
+            node: selected.1,
+            variant: selected.2,
         })
     }
 }
@@ -1583,6 +1592,50 @@ mod tests {
         }
     }
 
+    fn sample_windows_cuda_node(node_id: &str) -> NodeRecord {
+        NodeRecord {
+            node_id: node_id.to_string(),
+            hostname: format!("{node_id}.local"),
+            agent_endpoint: "http://127.0.0.1:50062".to_string(),
+            capabilities: common::v1::NodeCapabilities {
+                os: common::v1::OsType::Windows as i32,
+                cpu_arch: common::v1::CpuArch::X8664 as i32,
+                accelerators: vec![
+                    common::v1::AcceleratorInfo {
+                        r#type: common::v1::AcceleratorType::Cuda as i32,
+                        name: "RTX".to_string(),
+                        vram: Some(common::v1::Memory {
+                            total_bytes: 12 * 1024 * 1024 * 1024,
+                            available_bytes: 12 * 1024 * 1024 * 1024,
+                        }),
+                        compute_capability: "sm89".to_string(),
+                    },
+                    common::v1::AcceleratorInfo {
+                        r#type: common::v1::AcceleratorType::Cpu as i32,
+                        name: "CPU".to_string(),
+                        vram: None,
+                        compute_capability: String::new(),
+                    },
+                ],
+                system_memory: Some(common::v1::Memory {
+                    total_bytes: 32 * 1024 * 1024 * 1024,
+                    available_bytes: 28 * 1024 * 1024 * 1024,
+                }),
+                network_profile: common::v1::NetworkProfile::Lan as i32,
+                runtime_backends: vec!["llama.cpp".to_string(), "onnxruntime".to_string()],
+                locality: HashMap::new(),
+            },
+            status: common::v1::NodeStatus::Online as i32,
+            last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
+            version: "0.1.0".to_string(),
+            system_memory: Some(common::v1::Memory {
+                total_bytes: 32 * 1024 * 1024 * 1024,
+                available_bytes: 28 * 1024 * 1024 * 1024,
+            }),
+        }
+    }
+
     #[test]
     fn execution_pools_group_heterogeneous_nodes() {
         let pools = compute_execution_pools(&[
@@ -1664,6 +1717,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decision.node.node_id, local.node_id);
+    }
+
+    #[tokio::test]
+    async fn placement_engine_round_robins_across_local_macos_and_windows_pools() {
+        let engine = DefaultPlacementEngine::default();
+        let mac = sample_node("mac-node");
+        let windows = sample_windows_cuda_node("windows-node");
+        let manifest = common::v1::ModelManifest {
+            model_id: Some(common::v1::ModelId {
+                value: "qwen3.5-4b".to_string(),
+            }),
+            name: "Qwen3.5 4B".to_string(),
+            family: "chat".to_string(),
+            variants: vec![
+                common::v1::ModelVariant {
+                    runtime: "mlx".to_string(),
+                    quantization: "4bit".to_string(),
+                    format: "mlx".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![common::v1::AcceleratorType::Metal as i32],
+                },
+                common::v1::ModelVariant {
+                    runtime: "llama.cpp".to_string(),
+                    quantization: "q4_k_m".to_string(),
+                    format: "gguf".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![
+                        common::v1::AcceleratorType::Cpu as i32,
+                        common::v1::AcceleratorType::Cuda as i32,
+                    ],
+                },
+            ],
+            chat_template: "chatml".to_string(),
+            metadata: HashMap::new(),
+        };
+        let auth = AuthContext {
+            tenant_id: "tenant-dev".to_string(),
+            scopes: vec!["inference:write".to_string()],
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            require_mtls: false,
+            max_requests_per_minute: 120,
+            allowed_models: vec!["qwen3.5-4b".to_string()],
+            allowed_node_pools: vec![
+                "macos-metal-arm64".to_string(),
+                "windows-cuda-x86_64".to_string(),
+            ],
+            actor: "tenant:tenant-dev".to_string(),
+            credential_kind: CredentialKind::ApiKey,
+        };
+
+        let first = engine
+            .place_model(&manifest, &[mac.clone(), windows.clone()], &auth)
+            .await
+            .unwrap();
+        let second = engine
+            .place_model(&manifest, &[mac, windows], &auth)
+            .await
+            .unwrap();
+
+        assert_ne!(first.node.node_id, second.node.node_id);
+        assert!(matches!(
+            (first.pool.as_str(), second.pool.as_str()),
+            ("macos-metal-arm64", "windows-cuda-x86_64")
+                | ("windows-cuda-x86_64", "macos-metal-arm64")
+        ));
     }
 
     #[tokio::test]

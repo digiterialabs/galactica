@@ -1,0 +1,23 @@
+[package]
+name = "galactica-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+galactica-artifact = { workspace = true }
+galactica-common = { workspace = true }
+galactica-node-agent = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+zip = "2"
+flate2 = "1"
+tar = "0.4"
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ members = [
     "rust/galactica-control-plane",
     "rust/galactica-node-agent",
     "rust/galactica-gateway",
+    "rust/galactica-cli",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ galactica-observability = { path = "rust/galactica-observability" }
 galactica-networking = { path = "rust/galactica-networking" }
 galactica-artifact = { path = "rust/galactica-artifact" }
 galactica-control-plane = { path = "rust/galactica-control-plane" }
+galactica-node-agent = { path = "rust/galactica-node-agent" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

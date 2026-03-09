@@ -120,3 +120,37 @@ clean:
     cargo clean
     rm -rf python/.venv
     rm -rf dashboard/node_modules dashboard/.next
+
+# === Dev Cluster Helpers ===
+
+# Detect the current host profile and recommended runtime
+dev-detect:
+    cargo run -p galactica-cli -- detect
+
+# Check local prerequisites for the current host
+dev-doctor:
+    cargo run -p galactica-cli -- doctor
+
+# Prepare local state and print the next commands for this host
+dev-install:
+    cargo run -p galactica-cli -- install
+
+# Install galactica-cli into a user-local bin directory
+dev-self-install:
+    cargo run -p galactica-cli -- self-install
+
+# Start the dev control plane using checked-in defaults
+dev-control-plane:
+    cargo run -p galactica-cli -- up control-plane
+
+# Mint and save a bootstrap enrollment token to var/dev/enrollment-token.txt
+dev-token:
+    cargo run -p galactica-cli -- token mint
+
+# Start the dev gateway using checked-in defaults
+dev-gateway:
+    cargo run -p galactica-cli -- up gateway
+
+# Start the current machine as a node using auto-detected runtime/config
+dev-node:
+    cargo run -p galactica-cli -- up node

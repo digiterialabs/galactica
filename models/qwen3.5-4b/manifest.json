@@ -29,6 +29,7 @@
     "source_model_id": "Qwen/Qwen3.5-4B",
     "mlx_hf_repo": "mlx-community/Qwen3.5-4B-4bit",
     "llama_cpp_hf_repo": "AaryanK/Qwen3.5-4B-GGUF",
+    "llama_cpp_hf_file": "Qwen3.5-4B.Q4_K_M.gguf",
     "context_size": "8192",
     "reasoning_budget": "0"
   }

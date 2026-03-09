@@ -1,0 +1,13 @@
+listen_addr = "0.0.0.0:9090"
+state_db_path = "./var/dev/control-plane.db"
+model_registry_root = "./models"
+enrollment_secret = "galactica-dev-secret"
+heartbeat_interval_seconds = 15
+tenant_id = "tenant-dev"
+api_key = "galactica-dev-key"
+allowed_models = ["qwen3.5-4b"]
+allowed_node_pools = ["macos-metal-arm64", "windows-cuda-x86_64"]
+require_mtls = false
+print_enrollment_token = false
+enrollment_token_ttl_seconds = 3600
+mint_enrollment_token_only = false

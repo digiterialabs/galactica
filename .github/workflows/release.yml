@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary_name: galactica-cli
+            asset_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary_name: galactica-cli
+            asset_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary_name: galactica-cli
+            asset_ext: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary_name: galactica-cli.exe
+            asset_ext: zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Build galactica-cli
+        shell: bash
+        run: cargo build --release --locked -p galactica-cli
+
+      - name: Package Unix asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          stage_dir="dist/galactica-cli-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir -p "$stage_dir"
+          cp "target/release/${{ matrix.binary_name }}" "$stage_dir/galactica-cli"
+          chmod 755 "$stage_dir/galactica-cli"
+          tar -C dist -czf "dist/galactica-cli-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" "$(basename "$stage_dir")"
+
+      - name: Package Windows asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stageDir = "dist/galactica-cli-$env:RELEASE_TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item "target/release/${{ matrix.binary_name }}" "$stageDir/galactica-cli.exe"
+          Compress-Archive -Path "$stageDir/*" -DestinationPath "dist/galactica-cli-$env:RELEASE_TAG-${{ matrix.target }}.zip" -Force
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: galactica-cli-${{ matrix.target }}
+          path: dist/galactica-cli-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.asset_ext }}
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber

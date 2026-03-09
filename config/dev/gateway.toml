@@ -1,0 +1,7 @@
+listen_addr = "0.0.0.0:8080"
+control_plane_addr = "http://127.0.0.1:9090"
+global_requests_per_minute = 600
+default_tenant_requests_per_minute = 120
+session_history_limit = 64
+audit_limit = 100
+deployment_mode = "hybrid"

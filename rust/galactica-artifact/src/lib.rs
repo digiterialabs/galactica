@@ -417,7 +417,40 @@ fn variant_score(
     } else {
         0
     };
-    accelerator_bonus + runtime_bonus - (variant.size_bytes / (1024 * 1024 * 1024)) as i64
+    accelerator_bonus + runtime_bonus + runtime_preference_score(&variant.runtime, capabilities)
+        - (variant.size_bytes / (1024 * 1024 * 1024)) as i64
+}
+
+pub fn runtime_preference_score(runtime: &str, capabilities: &common::v1::NodeCapabilities) -> i64 {
+    let runtime = runtime.trim().to_ascii_lowercase();
+    let os = common::v1::OsType::try_from(capabilities.os).unwrap_or_default();
+    let cpu_arch = common::v1::CpuArch::try_from(capabilities.cpu_arch).unwrap_or_default();
+    let has_cuda = has_accelerator(capabilities, common::v1::AcceleratorType::Cuda);
+    let has_metal = has_accelerator(capabilities, common::v1::AcceleratorType::Metal);
+    let has_directml = has_accelerator(capabilities, common::v1::AcceleratorType::Directml);
+
+    match runtime.as_str() {
+        "mlx" if os == common::v1::OsType::Macos && cpu_arch == common::v1::CpuArch::Arm64 => 8,
+        "vllm" if has_cuda && os == common::v1::OsType::Linux => 7,
+        "llama.cpp" | "llamacpp" if has_cuda && os == common::v1::OsType::Windows => 6,
+        "onnxruntime" | "onnx" if has_directml && os == common::v1::OsType::Windows => 5,
+        "llama.cpp" | "llamacpp" if has_metal => 4,
+        "llama.cpp" | "llamacpp" if has_cuda => 4,
+        "onnxruntime" | "onnx" if has_cuda => 3,
+        "onnxruntime" | "onnx" if os == common::v1::OsType::Windows => 2,
+        "llama.cpp" | "llamacpp" => 2,
+        _ => 0,
+    }
+}
+
+fn has_accelerator(
+    capabilities: &common::v1::NodeCapabilities,
+    accelerator: common::v1::AcceleratorType,
+) -> bool {
+    capabilities
+        .accelerators
+        .iter()
+        .any(|candidate| candidate.r#type == accelerator as i32)
 }
 
 fn matches_runtime(manifest: &common::v1::ModelManifest, filter: Option<&str>) -> bool {
@@ -702,6 +735,49 @@ mod tests {
         }
     }
 
+    fn mixed_macos_capabilities() -> NodeCapabilities {
+        let mut capabilities = sample_capabilities();
+        capabilities.accelerators.push(AcceleratorInfo {
+            r#type: AcceleratorType::Cpu as i32,
+            name: "CPU".to_string(),
+            vram: None,
+            compute_capability: String::new(),
+        });
+        capabilities.runtime_backends = vec!["llama.cpp".to_string(), "mlx".to_string()];
+        capabilities
+    }
+
+    fn windows_cuda_capabilities() -> NodeCapabilities {
+        NodeCapabilities {
+            os: OsType::Windows as i32,
+            cpu_arch: CpuArch::X8664 as i32,
+            accelerators: vec![
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Cuda as i32,
+                    name: "RTX".to_string(),
+                    vram: Some(Memory {
+                        total_bytes: 12 * 1024 * 1024 * 1024,
+                        available_bytes: 12 * 1024 * 1024 * 1024,
+                    }),
+                    compute_capability: "sm89".to_string(),
+                },
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Cpu as i32,
+                    name: "CPU".to_string(),
+                    vram: None,
+                    compute_capability: String::new(),
+                },
+            ],
+            system_memory: Some(Memory {
+                total_bytes: 32 * 1024 * 1024 * 1024,
+                available_bytes: 28 * 1024 * 1024 * 1024,
+            }),
+            network_profile: NetworkProfile::Lan as i32,
+            runtime_backends: vec!["llama.cpp".to_string(), "onnxruntime".to_string()],
+            locality: HashMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn local_registry_scans_manifests() {
         let root =
@@ -731,5 +807,63 @@ mod tests {
         let selected = resolve_variant(&sample_manifest(), &sample_capabilities()).unwrap();
         assert_eq!(selected.runtime, "mlx");
         assert_eq!(selected.quantization, "4bit");
+    }
+
+    #[test]
+    fn variant_resolution_prefers_mlx_over_llama_cpp_on_apple_silicon() {
+        let manifest = ModelManifest {
+            variants: vec![
+                ModelVariant {
+                    runtime: "mlx".to_string(),
+                    quantization: "4bit".to_string(),
+                    format: "mlx".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![AcceleratorType::Metal as i32],
+                },
+                ModelVariant {
+                    runtime: "llama.cpp".to_string(),
+                    quantization: "q4_k_m".to_string(),
+                    format: "gguf".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![
+                        AcceleratorType::Cpu as i32,
+                        AcceleratorType::Metal as i32,
+                    ],
+                },
+            ],
+            ..sample_manifest()
+        };
+
+        let selected = resolve_variant(&manifest, &mixed_macos_capabilities()).unwrap();
+        assert_eq!(selected.runtime, "mlx");
+    }
+
+    #[test]
+    fn variant_resolution_prefers_llama_cpp_over_onnxruntime_on_windows_cuda() {
+        let manifest = ModelManifest {
+            variants: vec![
+                ModelVariant {
+                    runtime: "onnxruntime".to_string(),
+                    quantization: "int4".to_string(),
+                    format: "onnx".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![AcceleratorType::Cuda as i32],
+                },
+                ModelVariant {
+                    runtime: "llama.cpp".to_string(),
+                    quantization: "q4_k_m".to_string(),
+                    format: "gguf".to_string(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                    compatible_accelerators: vec![
+                        AcceleratorType::Cpu as i32,
+                        AcceleratorType::Cuda as i32,
+                    ],
+                },
+            ],
+            ..sample_manifest()
+        };
+
+        let selected = resolve_variant(&manifest, &windows_cuda_capabilities()).unwrap();
+        assert_eq!(selected.runtime, "llama.cpp");
     }
 }

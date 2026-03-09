@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use galactica_artifact::runtime_preference_score;
 use galactica_common::proto::{common, control};
 use galactica_networking::fingerprint_certificate;
 use galactica_node_agent::{
@@ -111,7 +112,7 @@ async fn main() -> Result<()> {
     let hostname = config.hostname.clone().unwrap_or(snapshot.hostname.clone());
     let capabilities = snapshot.capabilities.clone();
     let system_memory = snapshot.system_memory;
-    let backend = select_runtime_backend(&config, &capabilities.runtime_backends)?;
+    let backend = select_runtime_backend(&config, &capabilities)?;
     let backend_name = backend.get_capabilities().await?.runtime_name;
 
     let service = NodeAgentService::new(backend, capabilities.clone(), system_memory);
@@ -462,35 +463,35 @@ fn load_config(path: Option<&Path>) -> Result<FileConfig> {
 
 fn select_runtime_backend(
     config: &EffectiveConfig,
-    detected_backends: &[String],
+    capabilities: &common::v1::NodeCapabilities,
 ) -> Result<Arc<dyn RuntimeBackend>> {
     let preferred = config.runtime_backend.trim().to_ascii_lowercase();
+    let detected_backends = &capabilities.runtime_backends;
     let backend = match preferred.as_str() {
         "auto" => {
-            if detected_backends
+            let selected = detected_backends
                 .iter()
-                .any(|backend| backend == "llama.cpp")
-            {
-                Arc::new(LlamaCppBackend::with_model_registry(
+                .max_by_key(|backend| runtime_preference_score(backend, capabilities))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no supported runtime backend detected on this node")
+                })?
+                .as_str();
+            match selected {
+                "llama.cpp" | "llamacpp" => Arc::new(LlamaCppBackend::with_model_registry(
                     LlamaCppBackendConfig::default(),
                     &config.models_root,
-                )) as Arc<dyn RuntimeBackend>
-            } else if detected_backends.iter().any(|backend| backend == "mlx") {
-                Arc::new(MlxBackend::with_model_registry(
+                )) as Arc<dyn RuntimeBackend>,
+                "mlx" => Arc::new(MlxBackend::with_model_registry(
                     mlx_backend_config(config),
                     &config.models_root,
-                )) as Arc<dyn RuntimeBackend>
-            } else if detected_backends.iter().any(|backend| backend == "vllm") {
-                Arc::new(VllmBackend::new()) as Arc<dyn RuntimeBackend>
-            } else if detected_backends
-                .iter()
-                .any(|backend| backend == "onnxruntime")
-            {
-                Arc::new(OnnxBackend::new()) as Arc<dyn RuntimeBackend>
-            } else {
-                return Err(anyhow::anyhow!(
-                    "no supported runtime backend detected on this node"
-                ));
+                )) as Arc<dyn RuntimeBackend>,
+                "vllm" => Arc::new(VllmBackend::new()) as Arc<dyn RuntimeBackend>,
+                "onnxruntime" | "onnx" => Arc::new(OnnxBackend::new()) as Arc<dyn RuntimeBackend>,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "no supported runtime backend detected on this node: {other}"
+                    ));
+                }
             }
         }
         "llama.cpp" | "llamacpp" => Arc::new(LlamaCppBackend::with_model_registry(
@@ -540,5 +541,103 @@ fn mlx_backend_config(config: &EffectiveConfig) -> MlxBackendConfig {
     MlxBackendConfig {
         python_program,
         ..MlxBackendConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use galactica_common::proto::common::v1::{
+        AcceleratorInfo, AcceleratorType, CpuArch, Memory, NetworkProfile, NodeCapabilities, OsType,
+    };
+
+    use super::{EffectiveConfig, select_runtime_backend};
+
+    fn test_config() -> EffectiveConfig {
+        EffectiveConfig {
+            listen_addr: "127.0.0.1:50061".to_string(),
+            control_plane_addr: "http://127.0.0.1:9090".to_string(),
+            enrollment_token: None,
+            hostname: None,
+            agent_endpoint: None,
+            version: "test".to_string(),
+            runtime_backend: "auto".to_string(),
+            models_root: PathBuf::from("./models"),
+            heartbeat_interval_seconds: 15,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_runtime_prefers_mlx_on_apple_silicon() {
+        let capabilities = NodeCapabilities {
+            os: OsType::Macos as i32,
+            cpu_arch: CpuArch::Arm64 as i32,
+            accelerators: vec![
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Metal as i32,
+                    name: "Apple GPU".to_string(),
+                    vram: Some(Memory {
+                        total_bytes: 16,
+                        available_bytes: 16,
+                    }),
+                    compute_capability: "metal3".to_string(),
+                },
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Cpu as i32,
+                    name: "CPU".to_string(),
+                    vram: None,
+                    compute_capability: String::new(),
+                },
+            ],
+            system_memory: Some(Memory {
+                total_bytes: 32,
+                available_bytes: 24,
+            }),
+            network_profile: NetworkProfile::Lan as i32,
+            runtime_backends: vec!["llama.cpp".to_string(), "mlx".to_string()],
+            locality: HashMap::new(),
+        };
+
+        let backend = select_runtime_backend(&test_config(), &capabilities).unwrap();
+        let runtime = backend.get_capabilities().await.unwrap();
+        assert_eq!(runtime.runtime_name, "mlx");
+    }
+
+    #[tokio::test]
+    async fn auto_runtime_prefers_llama_cpp_on_windows_cuda() {
+        let capabilities = NodeCapabilities {
+            os: OsType::Windows as i32,
+            cpu_arch: CpuArch::X8664 as i32,
+            accelerators: vec![
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Cuda as i32,
+                    name: "RTX".to_string(),
+                    vram: Some(Memory {
+                        total_bytes: 16,
+                        available_bytes: 16,
+                    }),
+                    compute_capability: "sm89".to_string(),
+                },
+                AcceleratorInfo {
+                    r#type: AcceleratorType::Cpu as i32,
+                    name: "CPU".to_string(),
+                    vram: None,
+                    compute_capability: String::new(),
+                },
+            ],
+            system_memory: Some(Memory {
+                total_bytes: 64,
+                available_bytes: 48,
+            }),
+            network_profile: NetworkProfile::Lan as i32,
+            runtime_backends: vec!["llama.cpp".to_string(), "onnxruntime".to_string()],
+            locality: HashMap::new(),
+        };
+
+        let backend = select_runtime_backend(&test_config(), &capabilities).unwrap();
+        let runtime = backend.get_capabilities().await.unwrap();
+        assert_eq!(runtime.runtime_name, "llama.cpp");
     }
 }

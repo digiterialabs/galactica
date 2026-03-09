@@ -1,0 +1,5 @@
+listen_addr = "0.0.0.0:50061"
+control_plane_addr = "http://127.0.0.1:9090"
+runtime_backend = "llama.cpp"
+models_root = "./models"
+heartbeat_interval_seconds = 15

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+cd "$REPO_ROOT"
+exec cargo run -p galactica-gateway -- \
+  --config "$REPO_ROOT/config/dev/gateway.toml" \
+  "$@"

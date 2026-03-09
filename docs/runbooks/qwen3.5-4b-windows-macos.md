@@ -3,7 +3,7 @@
 This repo can run `qwen3.5-4b` in two useful modes:
 
 1. Windows local inference on a CUDA-capable NVIDIA machine via `llama.cpp`
-2. A mixed cluster where macOS uses `mlx` and Windows uses `llama.cpp`
+2. A mixed cluster where macOS uses `mlx` on Apple Silicon or `llama.cpp` on Intel, while Windows uses `llama.cpp`
 
 ## Prerequisites
 
@@ -15,8 +15,10 @@ This repo can run `qwen3.5-4b` in two useful modes:
 
 ### macOS node
 
-- Apple Silicon is assumed for the `mlx` path
-- Install `mlx-lm` into `.venv-mlx314`, `.venv-mlx`, or a `python3` on `PATH`
+- Apple Silicon uses the `mlx` path
+- Intel macOS uses the `llama.cpp` path and registers as `macos-cpu-x86_64`
+- Install `mlx-lm` into `.venv-mlx314`, `.venv-mlx`, or a `python3` on `PATH` for Apple Silicon
+- Install a `llama-server` build from `llama.cpp` or let `galactica-cli install` download it into `var/dev/runtimes/llama.cpp` for Intel macOS
 
 ## Preferred path
 
@@ -52,7 +54,7 @@ Prepare local state and print the next commands:
 cargo run -p galactica-cli -- install
 ```
 
-On macOS this bootstraps a local MLX virtualenv. On Windows it is intended to download a local `llama.cpp` runtime into `var/dev/runtimes/llama.cpp`.
+On Apple Silicon macOS this bootstraps a local MLX virtualenv. On Intel macOS and Windows it is intended to download a local `llama.cpp` runtime into `var/dev/runtimes/llama.cpp`.
 
 Install the CLI into a user-local bin directory and create a repo-bound `galactica` launcher:
 
@@ -61,6 +63,8 @@ cargo run -p galactica-cli -- self-install
 ```
 
 `self-install` now prefers a prebuilt `galactica-cli` asset from the latest GitHub Release for this repo. If the latest release does not match the workspace version in your checkout, it falls back to `cargo install` so the installed binary stays compatible with local source changes.
+
+On Intel macOS, `cargo run -p galactica-cli -- self-install` can use the published `x86_64-apple-darwin` release asset when the latest GitHub Release tag matches the workspace version in your checkout. Otherwise it still falls back to `cargo install`.
 
 ## Quick start
 
@@ -156,19 +160,22 @@ Check cluster state from the Mac:
 curl -s http://127.0.0.1:8080/admin/cluster -H 'x-api-key: galactica-dev-key'
 ```
 
-You should see both pools:
+You should see the Windows pool plus the matching macOS pool for your hardware:
 
 - `macos-metal-arm64`
+- `macos-cpu-x86_64`
 - `windows-cuda-x86_64`
 
-With the current scheduler, repeated compatible requests will round-robin across both local pools instead of pinning all traffic to the first pool name.
+Apple Silicon Macs will report `macos-metal-arm64`. Intel Macs will report `macos-cpu-x86_64`.
+
+With the current scheduler, repeated compatible requests will round-robin across the compatible local pools instead of pinning all traffic to the first pool name.
 
 ## Notes
 
 - `galactica-cli` lives in `rust/galactica-cli/` and is the preferred entry point
 - The checked-in configs live under `config/dev/`
 - `just dev-detect`, `just dev-doctor`, `just dev-install`, `just dev-control-plane`, `just dev-token`, `just dev-gateway`, and `just dev-node` wrap the CLI
-- Tagged pushes like `v0.1.4` publish prebuilt `galactica-cli` archives through GitHub Releases via `.github/workflows/release.yml`
+- Tagged pushes like `v0.1.5` publish prebuilt `galactica-cli` archives through GitHub Releases via `.github/workflows/release.yml`
 - The first load of `qwen3.5-4b` can download artifacts from Hugging Face
 - The `llama.cpp` variant is pinned to `Qwen3.5-4B.Q4_K_M.gguf`
 - If Windows cannot see the control plane, check firewall rules for ports `9090`, `8080`, and `50061`

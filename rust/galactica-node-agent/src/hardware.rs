@@ -674,6 +674,41 @@ mod tests {
         assert_eq!(capabilities.accelerators.len(), 2);
     }
 
+    #[test]
+    fn detects_intel_macos_cpu_llama_cpp_stack() {
+        let mut detector = DefaultHardwareDetector::new(FakeHardwareProbe {
+            hostname: "mbp-2019.local".to_string(),
+            os_type: common::v1::OsType::Macos,
+            cpu_arch: common::v1::CpuArch::X8664,
+            total_memory_bytes: 16 * 1024 * 1024 * 1024,
+            available_memory_bytes: 10 * 1024 * 1024 * 1024,
+            accelerators: vec![AcceleratorHint {
+                accelerator_type: common::v1::AcceleratorType::Cpu,
+                name: "Intel CPU".to_string(),
+                vram_bytes: None,
+                compute_capability: String::new(),
+            }],
+            cpu_utilization_percent: 28.0,
+            gpu_utilization_percent: None,
+            temperature_celsius: Some(61.0),
+            env: HashMap::new(),
+            commands: HashSet::from(["llama-server".to_string()]),
+        });
+
+        let snapshot = detector.detect_snapshot();
+        assert_eq!(snapshot.capabilities.os, common::v1::OsType::Macos as i32);
+        assert_eq!(
+            snapshot.capabilities.cpu_arch,
+            common::v1::CpuArch::X8664 as i32
+        );
+        assert_eq!(snapshot.capabilities.accelerators.len(), 1);
+        assert_eq!(
+            snapshot.capabilities.accelerators[0].r#type,
+            common::v1::AcceleratorType::Cpu as i32
+        );
+        assert_eq!(snapshot.capabilities.runtime_backends, vec!["llama.cpp"]);
+    }
+
     #[tokio::test]
     async fn hardware_monitor_samples_telemetry() {
         let monitor = HardwareMonitor::new(FakeHardwareProbe {

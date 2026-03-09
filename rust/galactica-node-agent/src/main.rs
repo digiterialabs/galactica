@@ -640,4 +640,29 @@ mod tests {
         let runtime = backend.get_capabilities().await.unwrap();
         assert_eq!(runtime.runtime_name, "llama.cpp");
     }
+
+    #[tokio::test]
+    async fn auto_runtime_prefers_llama_cpp_on_intel_macos() {
+        let capabilities = NodeCapabilities {
+            os: OsType::Macos as i32,
+            cpu_arch: CpuArch::X8664 as i32,
+            accelerators: vec![AcceleratorInfo {
+                r#type: AcceleratorType::Cpu as i32,
+                name: "Intel CPU".to_string(),
+                vram: None,
+                compute_capability: String::new(),
+            }],
+            system_memory: Some(Memory {
+                total_bytes: 16,
+                available_bytes: 12,
+            }),
+            network_profile: NetworkProfile::Lan as i32,
+            runtime_backends: vec!["llama.cpp".to_string()],
+            locality: HashMap::new(),
+        };
+
+        let backend = select_runtime_backend(&test_config(), &capabilities).unwrap();
+        let runtime = backend.get_capabilities().await.unwrap();
+        assert_eq!(runtime.runtime_name, "llama.cpp");
+    }
 }

@@ -1191,7 +1191,10 @@ mod tests {
                 require_mtls: false,
                 max_requests_per_minute: 60,
                 allowed_models: vec!["mistral-small".to_string()],
-                allowed_node_pools: vec!["macos-metal-arm64".to_string()],
+                allowed_node_pools: vec![
+                    "macos-metal-arm64".to_string(),
+                    "macos-cpu-x86_64".to_string(),
+                ],
                 expires_at: None,
             })
             .await

@@ -17,6 +17,15 @@ fi
 
 CONTROL_PLANE_ADDR="${GALACTICA_CONTROL_PLANE_ADDR:-http://127.0.0.1:9090}"
 AGENT_ENDPOINT="${GALACTICA_AGENT_ENDPOINT:-http://127.0.0.1:50061}"
+LLAMA_SERVER="${GALACTICA_LLAMA_SERVER:-}"
+
+if [[ -z "$LLAMA_SERVER" ]]; then
+  LLAMA_SERVER=$(find "$REPO_ROOT/var/dev/runtimes/llama.cpp/current" -type f -name 'llama-server' -print -quit 2>/dev/null || true)
+fi
+
+if [[ -n "$LLAMA_SERVER" ]]; then
+  export PATH="$(dirname "$LLAMA_SERVER"):$PATH"
+fi
 
 cd "$REPO_ROOT"
 exec cargo run -p galactica-node-agent -- \

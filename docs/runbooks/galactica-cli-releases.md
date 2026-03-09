@@ -4,7 +4,7 @@
 
 ## One-line install
 
-From a Galactica checkout on Apple Silicon macOS or Linux:
+From a Galactica checkout on macOS or Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/digiterialabs/galactica/main/scripts/install.sh | sh
@@ -25,6 +25,7 @@ These bootstrap scripts:
 
 Current release coverage:
 
+- Intel macOS
 - Apple Silicon macOS
 - Windows x64
 - Linux x64
@@ -34,20 +35,22 @@ Current release coverage:
 Create and push a semver tag:
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 That workflow builds native `galactica-cli` binaries for:
 
+- `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 - `x86_64-unknown-linux-gnu`
 
 It packages them into release assets named like:
 
-- `galactica-cli-v0.1.4-aarch64-apple-darwin.tar.gz`
-- `galactica-cli-v0.1.4-x86_64-pc-windows-msvc.zip`
+- `galactica-cli-v0.1.5-x86_64-apple-darwin.tar.gz`
+- `galactica-cli-v0.1.5-aarch64-apple-darwin.tar.gz`
+- `galactica-cli-v0.1.5-x86_64-pc-windows-msvc.zip`
 
 The publish job also uploads `SHA256SUMS.txt`.
 
@@ -63,4 +66,4 @@ It only uses the release asset when:
 
 If any of those checks fail, `self-install` falls back to `cargo install --path rust/galactica-cli`.
 
-At the moment, GitHub Releases publish assets for Apple Silicon macOS, Windows x64, and Linux x64. Intel macOS hosts still work, but `self-install` will fall back to `cargo install` because there is no x86_64 macOS release asset in this repo's workflow.
+GitHub Releases publish assets for Intel macOS, Apple Silicon macOS, Windows x64, and Linux x64. `self-install` can now resolve a prebuilt `x86_64-apple-darwin` asset on Intel Macs when the latest release matches the workspace version.

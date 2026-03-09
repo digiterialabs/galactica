@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-artifact"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-common"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "prost 0.13.5",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-control-plane"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-gateway"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-networking"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-node-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "galactica-observability"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "galactica-common",
  "http 1.4.0",

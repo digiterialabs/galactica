@@ -633,34 +633,31 @@ async fn cmd_up(repo_root: &Path, args: UpArgs) -> Result<()> {
 async fn detect_host(repo_root: &Path, model: &str) -> Result<DetectionReport> {
     let mut detector = DefaultHardwareDetector::default();
     let snapshot = detector.detect_snapshot();
+    let mut capabilities = snapshot.capabilities.clone();
+    add_repo_runtime_backends(repo_root, &mut capabilities);
     let registry = LocalModelRegistry::new(repo_root.join("models"));
     let manifest = registry.get_model_manifest(model).await.ok();
     let variant = manifest
         .as_ref()
-        .and_then(|manifest| resolve_variant(manifest, &snapshot.capabilities).ok());
+        .and_then(|manifest| resolve_variant(manifest, &capabilities).ok());
     let recommended_runtime = variant
         .as_ref()
         .map(|variant| variant.runtime.clone())
-        .or_else(|| fallback_runtime(&snapshot.capabilities));
+        .or_else(|| fallback_runtime(&capabilities));
     let recommended_quantization = variant.as_ref().map(|variant| variant.quantization.clone());
     let detected_local_ip = detect_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-    let node_config = default_node_config_for_capabilities(&snapshot.capabilities);
-    let notes = build_notes(
-        model,
-        manifest.as_ref(),
-        &snapshot.capabilities,
-        variant.as_ref(),
-    );
+    let node_config = default_node_config_for_capabilities(&capabilities);
+    let notes = build_notes(model, manifest.as_ref(), &capabilities, variant.as_ref());
 
     Ok(DetectionReport {
         repo_root: repo_root.display().to_string(),
         model: model.to_string(),
         hostname: snapshot.hostname,
-        os: os_label(snapshot.capabilities.os).to_string(),
-        cpu_arch: arch_label(snapshot.capabilities.cpu_arch).to_string(),
-        execution_pool: pool_label(&snapshot.capabilities),
-        accelerators: accelerator_labels(&snapshot.capabilities),
-        runtime_backends: snapshot.capabilities.runtime_backends.clone(),
+        os: os_label(capabilities.os).to_string(),
+        cpu_arch: arch_label(capabilities.cpu_arch).to_string(),
+        execution_pool: pool_label(&capabilities),
+        accelerators: accelerator_labels(&capabilities),
+        runtime_backends: capabilities.runtime_backends.clone(),
         recommended_runtime,
         recommended_quantization,
         recommended_node_config: node_config.display().to_string(),
@@ -1158,6 +1155,18 @@ fn select_llama_cpp_assets(
         }
     } else if os == "linux"
         && let Some(asset) = find_asset(release, &["bin-ubuntu", "x64"], &["vulkan", "rocm"])
+    {
+        selected.push(asset);
+    } else if os == "macos" && detection.cpu_arch == "aarch64" {
+        if let Some(asset) = find_asset(release, &["bin-macos-arm64"], &[])
+            .or_else(|| find_asset(release, &["bin-macos", "arm64"], &["x64"]))
+        {
+            selected.push(asset);
+        }
+    } else if os == "macos"
+        && detection.cpu_arch == "x86_64"
+        && let Some(asset) = find_asset(release, &["bin-macos-x64"], &[])
+            .or_else(|| find_asset(release, &["bin-macos", "x64"], &["arm64"]))
     {
         selected.push(asset);
     }
@@ -1813,6 +1822,8 @@ fn build_notes(
     variant: Option<&galactica_common::proto::common::v1::ModelVariant>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    let os = OsType::try_from(capabilities.os).unwrap_or_default();
+    let cpu_arch = CpuArch::try_from(capabilities.cpu_arch).unwrap_or_default();
     if manifest.is_none() {
         notes.push(format!(
             "model manifest for `{model}` was not found under {}",
@@ -1824,6 +1835,11 @@ fn build_notes(
     }
     if variant.is_none() {
         notes.push("no compatible model variant matched this machine; falling back to runtime-only recommendation".to_string());
+    }
+    if os == OsType::Macos && cpu_arch == CpuArch::X8664 {
+        notes.push(
+            "Intel macOS uses llama.cpp; MLX/Metal acceleration is Apple Silicon-only".to_string(),
+        );
     }
     if capabilities.runtime_backends.is_empty() {
         notes.push("the hardware detector did not find any runtime backends on PATH".to_string());
@@ -1865,6 +1881,18 @@ fn fallback_runtime(capabilities: &NodeCapabilities) -> Option<String> {
         .iter()
         .max_by_key(|runtime| runtime_preference_score(runtime, capabilities))
         .cloned()
+}
+
+fn add_repo_runtime_backends(repo_root: &Path, capabilities: &mut NodeCapabilities) {
+    if installed_llama_server(repo_root).is_some()
+        && !capabilities
+            .runtime_backends
+            .iter()
+            .any(|runtime| runtime.eq_ignore_ascii_case("llama.cpp"))
+    {
+        capabilities.runtime_backends.push("llama.cpp".to_string());
+        capabilities.runtime_backends.sort();
+    }
 }
 
 fn find_repo_root(override_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -2127,6 +2155,18 @@ mod tests {
                     browser_download_url: "https://example.com/linux-vulkan.tar.gz".to_string(),
                 },
                 GithubAsset {
+                    name: "llama-b-test-bin-macos-arm64.zip".to_string(),
+                    browser_download_url: "https://example.com/macos-arm64.zip".to_string(),
+                },
+                GithubAsset {
+                    name: "llama-b-test-bin-macos-x64.zip".to_string(),
+                    browser_download_url: "https://example.com/macos-x64.zip".to_string(),
+                },
+                GithubAsset {
+                    name: "galactica-cli-v0.1.0-x86_64-apple-darwin.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/cli-macos-x64.tar.gz".to_string(),
+                },
+                GithubAsset {
                     name: "galactica-cli-v0.1.0-aarch64-apple-darwin.tar.gz".to_string(),
                     browser_download_url: "https://example.com/cli-macos.tar.gz".to_string(),
                 },
@@ -2134,17 +2174,21 @@ mod tests {
                     name: "galactica-cli-v0.1.0-x86_64-pc-windows-msvc.zip".to_string(),
                     browser_download_url: "https://example.com/cli-windows.zip".to_string(),
                 },
+                GithubAsset {
+                    name: "galactica-cli-v0.1.0-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/cli-linux.tar.gz".to_string(),
+                },
             ],
         }
     }
 
-    fn sample_detection(os: &str, accelerators: &[&str]) -> DetectionReport {
+    fn sample_detection(os: &str, cpu_arch: &str, accelerators: &[&str]) -> DetectionReport {
         DetectionReport {
             repo_root: ".".to_string(),
             model: "qwen3.5-4b".to_string(),
             hostname: "host".to_string(),
             os: os.to_string(),
-            cpu_arch: "x86_64".to_string(),
+            cpu_arch: cpu_arch.to_string(),
             execution_pool: "pool".to_string(),
             accelerators: accelerators.iter().map(|value| value.to_string()).collect(),
             runtime_backends: vec!["llama.cpp".to_string()],
@@ -2159,9 +2203,11 @@ mod tests {
 
     #[test]
     fn selects_windows_cuda_llama_cpp_assets() {
-        let assets =
-            select_llama_cpp_assets(&sample_detection("windows", &["cuda"]), &sample_release())
-                .unwrap();
+        let assets = select_llama_cpp_assets(
+            &sample_detection("windows", "x86_64", &["cuda"]),
+            &sample_release(),
+        )
+        .unwrap();
         let names = assets
             .into_iter()
             .map(|asset| asset.name)
@@ -2172,12 +2218,25 @@ mod tests {
 
     #[test]
     fn selects_linux_cpu_asset_without_vulkan() {
-        let assets =
-            select_llama_cpp_assets(&sample_detection("linux", &["cpu"]), &sample_release())
-                .unwrap();
+        let assets = select_llama_cpp_assets(
+            &sample_detection("linux", "x86_64", &["cpu"]),
+            &sample_release(),
+        )
+        .unwrap();
         assert_eq!(assets.len(), 1);
         assert!(assets[0].name.contains("bin-ubuntu-x64"));
         assert!(!assets[0].name.contains("vulkan"));
+    }
+
+    #[test]
+    fn selects_macos_x64_asset() {
+        let assets = select_llama_cpp_assets(
+            &sample_detection("macos", "x86_64", &["cpu"]),
+            &sample_release(),
+        )
+        .unwrap();
+        assert_eq!(assets.len(), 1);
+        assert!(assets[0].name.contains("bin-macos-x64"));
     }
 
     #[test]
@@ -2185,6 +2244,13 @@ mod tests {
         let asset = select_galactica_cli_asset(&sample_release(), "x86_64-pc-windows-msvc", ".zip")
             .unwrap();
         assert!(asset.name.contains("x86_64-pc-windows-msvc"));
+    }
+
+    #[test]
+    fn selects_galactica_cli_release_asset_for_intel_macos() {
+        let asset = select_galactica_cli_asset(&sample_release(), "x86_64-apple-darwin", ".tar.gz")
+            .unwrap();
+        assert!(asset.name.contains("x86_64-apple-darwin"));
     }
 
     #[test]
@@ -2226,6 +2292,10 @@ repository = "https://github.com/digiterialabs/galactica"
         assert_eq!(
             galactica_cli_target_triple("macos", "aarch64"),
             Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            galactica_cli_target_triple("macos", "x86_64"),
+            Some("x86_64-apple-darwin")
         );
         assert_eq!(
             galactica_cli_target_triple("windows", "x86_64"),

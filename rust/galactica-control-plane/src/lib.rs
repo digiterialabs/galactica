@@ -1924,7 +1924,10 @@ mod tests {
             require_mtls: false,
             max_requests_per_minute: 120,
             allowed_models: vec!["mistral-small".to_string()],
-            allowed_node_pools: vec!["macos-metal-arm64".to_string()],
+            allowed_node_pools: vec![
+                "macos-metal-arm64".to_string(),
+                "macos-cpu-x86_64".to_string(),
+            ],
             expires_at: None,
         }
     }
@@ -1991,6 +1994,39 @@ mod tests {
         let mut node = sample_node(node_id);
         node.capabilities.runtime_backends = vec!["mlx".to_string(), "llama.cpp".to_string()];
         node
+    }
+
+    fn sample_intel_macos_llama_cpp_node(node_id: &str) -> NodeRecord {
+        NodeRecord {
+            node_id: node_id.to_string(),
+            hostname: format!("{node_id}.local"),
+            agent_endpoint: "http://127.0.0.1:50063".to_string(),
+            capabilities: common::v1::NodeCapabilities {
+                os: common::v1::OsType::Macos as i32,
+                cpu_arch: common::v1::CpuArch::X8664 as i32,
+                accelerators: vec![common::v1::AcceleratorInfo {
+                    r#type: common::v1::AcceleratorType::Cpu as i32,
+                    name: "Intel CPU".to_string(),
+                    vram: None,
+                    compute_capability: String::new(),
+                }],
+                system_memory: Some(common::v1::Memory {
+                    total_bytes: 16 * 1024 * 1024 * 1024,
+                    available_bytes: 12 * 1024 * 1024 * 1024,
+                }),
+                network_profile: common::v1::NetworkProfile::Lan as i32,
+                runtime_backends: vec!["llama.cpp".to_string()],
+                locality: HashMap::new(),
+            },
+            status: common::v1::NodeStatus::Online as i32,
+            last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
+            version: "0.1.0".to_string(),
+            system_memory: Some(common::v1::Memory {
+                total_bytes: 16 * 1024 * 1024 * 1024,
+                available_bytes: 12 * 1024 * 1024 * 1024,
+            }),
+        }
     }
 
     fn distributed_qwen_manifest() -> common::v1::ModelManifest {
@@ -2128,6 +2164,7 @@ mod tests {
     fn execution_pools_group_heterogeneous_nodes() {
         let pools = compute_execution_pools(&[
             sample_node("node-a"),
+            sample_intel_macos_llama_cpp_node("intel-mac"),
             NodeRecord {
                 node_id: "node-b".to_string(),
                 hostname: "node-b".to_string(),
@@ -2157,6 +2194,7 @@ mod tests {
             },
         ]);
         assert!(pools.contains_key("macos-metal-arm64"));
+        assert!(pools.contains_key("macos-cpu-x86_64"));
         assert!(pools.contains_key("linux-cuda-x86_64"));
     }
 
@@ -2349,6 +2387,59 @@ mod tests {
                 .iter()
                 .all(|shard| shard.memory_budget_bytes <= 10 * 1024 * 1024 * 1024)
         );
+    }
+
+    #[tokio::test]
+    async fn placement_engine_accepts_intel_macos_cpu_pool_for_llama_cpp() {
+        let engine = DefaultPlacementEngine::default();
+        let manifest = common::v1::ModelManifest {
+            model_id: Some(common::v1::ModelId {
+                value: "qwen3.5-4b".to_string(),
+            }),
+            name: "Qwen3.5 4B".to_string(),
+            family: "chat".to_string(),
+            variants: vec![common::v1::ModelVariant {
+                runtime: "llama.cpp".to_string(),
+                quantization: "q4_k_m".to_string(),
+                format: "gguf".to_string(),
+                size_bytes: 2 * 1024 * 1024 * 1024,
+                compatible_accelerators: vec![common::v1::AcceleratorType::Cpu as i32],
+                distributed: None,
+            }],
+            chat_template: "chatml".to_string(),
+            metadata: HashMap::new(),
+        };
+        let auth = AuthContext {
+            tenant_id: "tenant-dev".to_string(),
+            scopes: vec!["inference:write".to_string()],
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            require_mtls: false,
+            max_requests_per_minute: 120,
+            allowed_models: vec!["qwen3.5-4b".to_string()],
+            allowed_node_pools: vec!["macos-cpu-x86_64".to_string()],
+            actor: "tenant:tenant-dev".to_string(),
+            credential_kind: CredentialKind::ApiKey,
+        };
+
+        let placement = engine
+            .place_model(
+                &manifest,
+                &[sample_intel_macos_llama_cpp_node("intel-mac-node")],
+                &auth,
+            )
+            .await
+            .unwrap();
+
+        match placement {
+            PlacementDecision::Single(placement) => {
+                assert_eq!(placement.pool, "macos-cpu-x86_64");
+                assert_eq!(placement.variant.runtime, "llama.cpp");
+                assert_eq!(placement.node.node_id, "intel-mac-node");
+            }
+            PlacementDecision::Distributed(_) => {
+                panic!("expected single-node placement for Intel macOS llama.cpp");
+            }
+        }
     }
 
     #[tokio::test]

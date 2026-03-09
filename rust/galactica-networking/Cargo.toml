@@ -10,6 +10,10 @@ galactica-observability = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+libp2p = { workspace = true }
+url = { workspace = true }
 
 [lints]
 workspace = true

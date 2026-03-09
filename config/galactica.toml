@@ -1,0 +1,23 @@
+# Galactica Control Plane Configuration
+
+[server]
+listen_addr = "0.0.0.0:9090"
+
+[database]
+url = "postgres://localhost:5432/galactica"
+max_connections = 10
+
+[network]
+mode = "local"  # "local" for mDNS, "rendezvous" for cloud/WAN
+
+[scheduling]
+heartbeat_timeout_seconds = 30
+heartbeat_interval_seconds = 10
+
+[security]
+require_mtls = false
+enrollment_token_ttl_hours = 24
+
+[logging]
+level = "info"
+format = "text"  # "text" or "json"

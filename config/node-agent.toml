@@ -1,0 +1,18 @@
+# Galactica Node Agent Configuration
+
+[agent]
+control_plane_addr = "http://localhost:9090"
+
+[cache]
+dir = "/tmp/galactica/cache"
+max_bytes = 10737418240  # 10 GB
+
+[hardware]
+monitor_interval_seconds = 10
+
+[runtime]
+discovery_interval_seconds = 30
+
+[logging]
+level = "info"
+format = "text"

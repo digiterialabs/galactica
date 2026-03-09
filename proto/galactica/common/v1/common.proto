@@ -117,6 +117,7 @@ message ModelVariant {
   string format = 3;
   uint64 size_bytes = 4;
   repeated AcceleratorType compatible_accelerators = 5;
+  DistributedExecutionPolicy distributed = 6;
 }
 
 message ModelManifest {
@@ -126,6 +127,27 @@ message ModelManifest {
   repeated ModelVariant variants = 4;
   string chat_template = 5;
   map<string, string> metadata = 6;
+}
+
+message DistributedExecutionPolicy {
+  string backend_family = 1;
+  uint32 min_shards = 2;
+  uint32 max_shards = 3;
+  uint32 preferred_shards = 4;
+  uint64 per_shard_overhead_bytes = 5;
+  bool requires_homogeneous_backend = 6;
+  bool supports_generation = 7;
+  bool supports_embedding = 8;
+}
+
+message ShardAssignment {
+  NodeId node_id = 1;
+  uint32 shard_index = 2;
+  uint32 shard_count = 3;
+  bool is_coordinator = 4;
+  string backend_family = 5;
+  uint64 memory_budget_bytes = 6;
+  string agent_endpoint = 7;
 }
 
 // === Event Types ===

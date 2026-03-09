@@ -27,6 +27,7 @@ message GetCapabilitiesResponse {
   bool supports_embedding = 5;
   bool supports_streaming = 6;
   uint64 max_model_size_bytes = 7;
+  bool supports_distributed = 8;
 }
 
 message ListRuntimeModelsRequest {}
@@ -41,6 +42,10 @@ message RuntimeModelInfo {
   string quantization = 3;
   uint64 memory_used_bytes = 4;
   bool ready = 5;
+  string group_id = 6;
+  uint32 shard_index = 7;
+  bool is_coordinator = 8;
+  string backend_family = 9;
 }
 
 message EnsureModelRequest {
@@ -60,6 +65,7 @@ message LoadRuntimeModelRequest {
   string quantization = 2;
   uint64 max_memory_bytes = 3;
   map<string, string> runtime_options = 4;
+  DistributedRuntimeSpec distributed = 5;
 }
 
 message LoadRuntimeModelResponse {
@@ -67,6 +73,9 @@ message LoadRuntimeModelResponse {
   bool success = 2;
   string error_message = 3;
   uint64 memory_used_bytes = 4;
+  string group_id = 5;
+  uint32 shard_index = 6;
+  bool is_coordinator = 7;
 }
 
 message UnloadRuntimeModelRequest {
@@ -167,4 +176,14 @@ message RuntimeMemoryPressureEvent {
   uint64 available_bytes = 1;
   uint64 total_bytes = 2;
   float pressure_percent = 3;
+}
+
+message DistributedRuntimeSpec {
+  string group_id = 1;
+  string backend_family = 2;
+  uint32 shard_index = 3;
+  uint32 shard_count = 4;
+  bool is_coordinator = 5;
+  repeated galactica.common.v1.ShardAssignment shard_assignments = 6;
+  map<string, string> runtime_options = 7;
 }

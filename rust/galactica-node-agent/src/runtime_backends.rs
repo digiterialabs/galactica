@@ -25,6 +25,16 @@ struct ManagedLoadedModel {
     quantization: String,
     memory_used_bytes: u64,
     ready: bool,
+    distributed: Option<DistributedModelMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct DistributedModelMetadata {
+    group_id: String,
+    shard_index: u32,
+    _shard_count: u32,
+    is_coordinator: bool,
+    backend_family: String,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +46,7 @@ struct ManagedRuntimeSpec {
     supported_quantizations: Vec<String>,
     supports_embedding: bool,
     supports_streaming: bool,
+    supports_distributed: bool,
     max_model_size_bytes: u64,
     instance_prefix: String,
     synthetic_prefix: String,
@@ -63,6 +74,23 @@ impl ManagedRuntimeSpec {
                 .unwrap_or_else(|| "default".to_string());
         }
         quantization.to_string()
+    }
+}
+
+impl DistributedModelMetadata {
+    fn from_runtime_request(
+        request: &runtime::v1::LoadRuntimeModelRequest,
+    ) -> Option<DistributedModelMetadata> {
+        request
+            .distributed
+            .as_ref()
+            .map(|distributed| DistributedModelMetadata {
+                group_id: distributed.group_id.clone(),
+                shard_index: distributed.shard_index,
+                _shard_count: distributed.shard_count,
+                is_coordinator: distributed.is_coordinator,
+                backend_family: distributed.backend_family.clone(),
+            })
     }
 }
 
@@ -288,6 +316,25 @@ impl ManagedRuntimeBackend {
                 quantization: instance.quantization.clone(),
                 memory_used_bytes: instance.memory_used_bytes,
                 ready: instance.ready,
+                group_id: instance
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.group_id.clone())
+                    .unwrap_or_default(),
+                shard_index: instance
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.shard_index)
+                    .unwrap_or_default(),
+                is_coordinator: instance
+                    .distributed
+                    .as_ref()
+                    .is_some_and(|distributed| distributed.is_coordinator),
+                backend_family: instance
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.backend_family.clone())
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -304,6 +351,7 @@ impl RuntimeBackend for ManagedRuntimeBackend {
             supports_embedding: self.spec.supports_embedding,
             supports_streaming: self.spec.supports_streaming,
             max_model_size_bytes: self.spec.max_model_size_bytes,
+            supports_distributed: self.spec.supports_distributed,
         })
     }
 
@@ -362,6 +410,7 @@ impl RuntimeBackend for ManagedRuntimeBackend {
             .ok_or_else(|| GalacticaError::invalid_argument("model_id is required"))?;
         let instance_id = format!("{}-{}", self.spec.instance_prefix, uuid::Uuid::new_v4());
         let memory_used_bytes = self.memory_for_request(&request);
+        let distributed = DistributedModelMetadata::from_runtime_request(&request);
 
         self.loaded_models.write().await.insert(
             instance_id.clone(),
@@ -371,6 +420,7 @@ impl RuntimeBackend for ManagedRuntimeBackend {
                 quantization: self.spec.normalize_quantization(&request.quantization),
                 memory_used_bytes,
                 ready: true,
+                distributed: distributed.clone(),
             },
         );
         self.transition_process(RuntimeLifecycleState::Ready)
@@ -383,6 +433,17 @@ impl RuntimeBackend for ManagedRuntimeBackend {
             success: true,
             error_message: String::new(),
             memory_used_bytes,
+            group_id: distributed
+                .as_ref()
+                .map(|distributed| distributed.group_id.clone())
+                .unwrap_or_default(),
+            shard_index: distributed
+                .as_ref()
+                .map(|distributed| distributed.shard_index)
+                .unwrap_or_default(),
+            is_coordinator: distributed
+                .as_ref()
+                .is_some_and(|distributed| distributed.is_coordinator),
         })
     }
 
@@ -584,6 +645,7 @@ struct MlxLoadedModel {
     quantization: String,
     memory_used_bytes: u64,
     ready: bool,
+    distributed: Option<DistributedModelMetadata>,
     api_model_name: String,
     endpoint: String,
     handle: Arc<Mutex<RuntimeHandle>>,
@@ -643,6 +705,7 @@ impl MlxBackend {
                 ],
                 supports_embedding: true,
                 supports_streaming: true,
+                supports_distributed: true,
                 max_model_size_bytes: 32 * 1024 * 1024 * 1024,
                 instance_prefix: "mlx".to_string(),
                 synthetic_prefix: "MLX".to_string(),
@@ -692,6 +755,7 @@ impl RealMlxBackend {
             supports_embedding: false,
             supports_streaming: true,
             max_model_size_bytes: 32 * 1024 * 1024 * 1024,
+            supports_distributed: true,
         }
     }
 
@@ -1000,6 +1064,25 @@ impl RuntimeBackend for MlxBackend {
                         quantization: instance.quantization.clone(),
                         memory_used_bytes: instance.memory_used_bytes,
                         ready: instance.ready,
+                        group_id: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.group_id.clone())
+                            .unwrap_or_default(),
+                        shard_index: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.shard_index)
+                            .unwrap_or_default(),
+                        is_coordinator: instance
+                            .distributed
+                            .as_ref()
+                            .is_some_and(|distributed| distributed.is_coordinator),
+                        backend_family: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.backend_family.clone())
+                            .unwrap_or_default(),
                     })
                     .collect())
             }
@@ -1076,6 +1159,7 @@ impl RuntimeBackend for MlxBackend {
                 let api_model_name = inner.wait_for_ready(&endpoint, &handle).await?;
 
                 let instance_id = format!("mlx-{}", uuid::Uuid::new_v4());
+                let distributed = DistributedModelMetadata::from_runtime_request(&request);
                 let memory_used_bytes = request
                     .max_memory_bytes
                     .max(variant.size_bytes)
@@ -1088,6 +1172,7 @@ impl RuntimeBackend for MlxBackend {
                         quantization: variant.quantization.clone(),
                         memory_used_bytes,
                         ready: true,
+                        distributed: distributed.clone(),
                         api_model_name,
                         endpoint,
                         handle,
@@ -1102,6 +1187,17 @@ impl RuntimeBackend for MlxBackend {
                     success: true,
                     error_message: String::new(),
                     memory_used_bytes,
+                    group_id: distributed
+                        .as_ref()
+                        .map(|distributed| distributed.group_id.clone())
+                        .unwrap_or_default(),
+                    shard_index: distributed
+                        .as_ref()
+                        .map(|distributed| distributed.shard_index)
+                        .unwrap_or_default(),
+                    is_coordinator: distributed
+                        .as_ref()
+                        .is_some_and(|distributed| distributed.is_coordinator),
                 })
             }
         }
@@ -1383,6 +1479,7 @@ impl VllmBackend {
                 ],
                 supports_embedding: true,
                 supports_streaming: true,
+                supports_distributed: false,
                 max_model_size_bytes: 96 * 1024 * 1024 * 1024,
                 instance_prefix: "vllm".to_string(),
                 synthetic_prefix: "vLLM".to_string(),
@@ -1471,6 +1568,7 @@ struct LlamaCppLoadedModel {
     quantization: String,
     memory_used_bytes: u64,
     ready: bool,
+    distributed: Option<DistributedModelMetadata>,
     alias: String,
     endpoint: String,
     handle: Arc<Mutex<RuntimeHandle>>,
@@ -1535,6 +1633,7 @@ impl LlamaCppBackend {
                 ],
                 supports_embedding: true,
                 supports_streaming: true,
+                supports_distributed: true,
                 max_model_size_bytes: 32 * 1024 * 1024 * 1024,
                 instance_prefix: "llama".to_string(),
                 synthetic_prefix: "llama.cpp".to_string(),
@@ -1598,6 +1697,7 @@ impl RealLlamaCppBackend {
             supports_embedding: false,
             supports_streaming: true,
             max_model_size_bytes: 32 * 1024 * 1024 * 1024,
+            supports_distributed: true,
         }
     }
 
@@ -1911,6 +2011,25 @@ impl RuntimeBackend for LlamaCppBackend {
                         quantization: instance.quantization.clone(),
                         memory_used_bytes: instance.memory_used_bytes,
                         ready: instance.ready,
+                        group_id: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.group_id.clone())
+                            .unwrap_or_default(),
+                        shard_index: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.shard_index)
+                            .unwrap_or_default(),
+                        is_coordinator: instance
+                            .distributed
+                            .as_ref()
+                            .is_some_and(|distributed| distributed.is_coordinator),
+                        backend_family: instance
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.backend_family.clone())
+                            .unwrap_or_default(),
                     })
                     .collect())
             }
@@ -1986,6 +2105,7 @@ impl RuntimeBackend for LlamaCppBackend {
                 inner.wait_for_ready(&endpoint, &handle).await?;
 
                 let instance_id = format!("llama-{}", uuid::Uuid::new_v4());
+                let distributed = DistributedModelMetadata::from_runtime_request(&request);
                 let memory_used_bytes = request
                     .max_memory_bytes
                     .max(variant.size_bytes)
@@ -1998,6 +2118,7 @@ impl RuntimeBackend for LlamaCppBackend {
                         quantization: variant.quantization.clone(),
                         memory_used_bytes,
                         ready: true,
+                        distributed: distributed.clone(),
                         alias,
                         endpoint,
                         handle,
@@ -2012,6 +2133,17 @@ impl RuntimeBackend for LlamaCppBackend {
                     success: true,
                     error_message: String::new(),
                     memory_used_bytes,
+                    group_id: distributed
+                        .as_ref()
+                        .map(|distributed| distributed.group_id.clone())
+                        .unwrap_or_default(),
+                    shard_index: distributed
+                        .as_ref()
+                        .map(|distributed| distributed.shard_index)
+                        .unwrap_or_default(),
+                    is_coordinator: distributed
+                        .as_ref()
+                        .is_some_and(|distributed| distributed.is_coordinator),
                 })
             }
         }
@@ -2310,6 +2442,7 @@ impl OnnxBackend {
                 ],
                 supports_embedding: true,
                 supports_streaming: true,
+                supports_distributed: false,
                 max_model_size_bytes: 48 * 1024 * 1024 * 1024,
                 instance_prefix: "onnx".to_string(),
                 synthetic_prefix: "ONNX Runtime".to_string(),
@@ -2435,6 +2568,7 @@ mod tests {
                 format: "safetensors".to_string(),
                 size_bytes: 4 * 1024 * 1024 * 1024,
                 compatible_accelerators: vec![],
+                distributed: None,
             }],
             chat_template: "default".to_string(),
             metadata: HashMap::from([(
@@ -2474,6 +2608,7 @@ mod tests {
                     "tensor_parallel_size".to_string(),
                     "2".to_string(),
                 )]),
+                distributed: None,
             })
             .await
             .unwrap();
@@ -2502,6 +2637,7 @@ mod tests {
                 quantization: "q4_k_m".to_string(),
                 max_memory_bytes: 2 * 1024 * 1024 * 1024,
                 runtime_options: HashMap::new(),
+                distributed: None,
             })
             .await
             .unwrap();
@@ -2562,6 +2698,7 @@ mod tests {
                     "execution_provider".to_string(),
                     "directml".to_string(),
                 )]),
+                distributed: None,
             })
             .await
             .unwrap();

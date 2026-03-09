@@ -29,12 +29,16 @@ message LoadModelRequest {
   string variant_runtime = 2;
   string variant_quantization = 3;
   uint64 max_memory_bytes = 4;
+  DistributedGroupSpec distributed = 5;
 }
 
 message LoadModelResponse {
   galactica.common.v1.InstanceId instance_id = 1;
   bool success = 2;
   string error_message = 3;
+  string group_id = 4;
+  uint32 shard_index = 5;
+  bool is_coordinator = 6;
 }
 
 message UnloadModelRequest {
@@ -60,4 +64,18 @@ message ModelInstance {
   galactica.common.v1.ModelId model_id = 2;
   string runtime = 3;
   uint64 memory_used_bytes = 4;
+  string group_id = 5;
+  uint32 shard_index = 6;
+  bool is_coordinator = 7;
+  string backend_family = 8;
+}
+
+message DistributedGroupSpec {
+  string group_id = 1;
+  string backend_family = 2;
+  uint32 shard_index = 3;
+  uint32 shard_count = 4;
+  bool is_coordinator = 5;
+  repeated galactica.common.v1.ShardAssignment shard_assignments = 6;
+  map<string, string> runtime_options = 7;
 }

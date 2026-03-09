@@ -1,0 +1,36 @@
+{
+  "model_id": "deepseek-r1-distill-qwen-14b",
+  "name": "DeepSeek R1 Distill Qwen 14B",
+  "family": "chat",
+  "variants": [
+    {
+      "runtime": "mlx",
+      "quantization": "4bit",
+      "format": "mlx",
+      "size_bytes": 9663676416,
+      "compatible_accelerators": [
+        2
+      ]
+    },
+    {
+      "runtime": "llama.cpp",
+      "quantization": "q4_k_m",
+      "format": "gguf",
+      "size_bytes": 10200547328,
+      "compatible_accelerators": [
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "chat_template": "chatml",
+  "metadata": {
+    "source_model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    "mlx_hf_repo": "mlx-community/DeepSeek-R1-Distill-Qwen-14B-MLX",
+    "llama_cpp_hf_repo": "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+    "llama_cpp_hf_file": "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf",
+    "context_size": "8192",
+    "reasoning_budget": "0"
+  }
+}

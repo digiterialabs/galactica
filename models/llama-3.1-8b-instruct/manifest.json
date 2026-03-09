@@ -1,0 +1,36 @@
+{
+  "model_id": "llama-3.1-8b-instruct",
+  "name": "Llama 3.1 8B Instruct",
+  "family": "chat",
+  "variants": [
+    {
+      "runtime": "mlx",
+      "quantization": "4bit",
+      "format": "mlx",
+      "size_bytes": 5368709120,
+      "compatible_accelerators": [
+        2
+      ]
+    },
+    {
+      "runtime": "llama.cpp",
+      "quantization": "q4_k_m",
+      "format": "gguf",
+      "size_bytes": 5905580032,
+      "compatible_accelerators": [
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "chat_template": "llama3",
+  "metadata": {
+    "source_model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "mlx_hf_repo": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "llama_cpp_hf_repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+    "llama_cpp_hf_file": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "context_size": "8192",
+    "reasoning_budget": "0"
+  }
+}

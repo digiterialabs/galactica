@@ -1,6 +1,6 @@
 mod store;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +9,10 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::Stream;
-use galactica_artifact::{ModelRegistry, resolve_variant};
+use galactica_artifact::{
+    ModelRegistry, node_available_memory_bytes, resolve_variant, supported_accelerators,
+    variant_memory_budget_bytes, variant_supports_node_runtime_and_accelerator,
+};
 use galactica_common::inference::{
     InferenceChunk, InferenceRequest, InferenceUsage, NodeExecutionPayload, estimate_tokens,
 };
@@ -27,10 +30,10 @@ use tracing::{Instrument, info_span};
 
 pub use control::v1::control_plane_server::{ControlPlane, ControlPlaneServer};
 pub use store::{
-    AuditRecord, AuthContext, ClusterState, ControlEvent, CredentialKind, DownloadRecord,
-    EnrollmentTokenRecord, EventEnvelope, InMemoryStateStore, InstanceStatus, ModelInstanceRecord,
-    NodeIdentityRecord, NodeRecord, SqliteStateStore, StateStore, TaskRecord, TenantRecord,
-    event_apply,
+    AuditRecord, AuthContext, ClusterState, ControlEvent, CredentialKind, DistributedGroupRecord,
+    DownloadRecord, EnrollmentTokenRecord, EventEnvelope, InMemoryStateStore, InstanceStatus,
+    ModelInstanceRecord, NodeIdentityRecord, NodeRecord, SqliteStateStore, StateStore, TaskRecord,
+    TenantRecord, event_apply,
 };
 
 type InferStream =
@@ -190,10 +193,47 @@ pub struct Scheduler {
 }
 
 #[derive(Debug, Clone)]
-pub struct PlacementDecision {
+pub struct SingleNodePlacement {
     pub pool: String,
     pub node: NodeRecord,
     pub variant: common::v1::ModelVariant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShardPlacement {
+    pub pool: String,
+    pub node: NodeRecord,
+    pub shard_index: u32,
+    pub shard_count: u32,
+    pub is_coordinator: bool,
+    pub backend_family: String,
+    pub memory_budget_bytes: u64,
+    pub variant: common::v1::ModelVariant,
+}
+
+#[derive(Debug, Clone)]
+pub struct DistributedPlacement {
+    pub backend_family: String,
+    pub runtime: String,
+    pub quantization: String,
+    pub shard_count: u32,
+    pub shards: Vec<ShardPlacement>,
+    pub variant: common::v1::ModelVariant,
+}
+
+impl DistributedPlacement {
+    pub fn coordinator(&self) -> &ShardPlacement {
+        self.shards
+            .iter()
+            .find(|shard| shard.is_coordinator)
+            .unwrap_or(&self.shards[0])
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PlacementDecision {
+    Single(Box<SingleNodePlacement>),
+    Distributed(Box<DistributedPlacement>),
 }
 
 #[derive(Default)]
@@ -216,6 +256,18 @@ impl DefaultPlacementEngine {
                 continue;
             }
             if resolve_variant(manifest, &node.capabilities).is_ok() {
+                compatible.insert(pool);
+                continue;
+            }
+            let accelerators = supported_accelerators(&node.capabilities);
+            if manifest.variants.iter().any(|variant| {
+                variant.distributed.is_some()
+                    && variant_supports_node_runtime_and_accelerator(
+                        variant,
+                        &node.capabilities,
+                        &accelerators,
+                    )
+            }) {
                 compatible.insert(pool);
             }
         }
@@ -251,17 +303,135 @@ impl DefaultPlacementEngine {
         }
 
         if !local_pools.is_empty() {
-            return self.scheduler.select_node(&local_pools).await;
+            return self
+                .scheduler
+                .select_single_node(&local_pools)
+                .await
+                .map(|placement| PlacementDecision::Single(Box::new(placement)));
         }
-        self.scheduler.select_node(&remote_pools).await
+        if !remote_pools.is_empty() {
+            return self
+                .scheduler
+                .select_single_node(&remote_pools)
+                .await
+                .map(|placement| PlacementDecision::Single(Box::new(placement)));
+        }
+
+        if let Some(distributed) = self
+            .select_distributed_group(manifest, nodes, auth, false)
+            .await?
+        {
+            return Ok(PlacementDecision::Distributed(Box::new(distributed)));
+        }
+        if let Some(distributed) = self
+            .select_distributed_group(manifest, nodes, auth, true)
+            .await?
+        {
+            return Ok(PlacementDecision::Distributed(Box::new(distributed)));
+        }
+        Err(GalacticaError::failed_precondition(
+            "no execution pools available",
+        ))
+    }
+
+    async fn select_distributed_group(
+        &self,
+        manifest: &common::v1::ModelManifest,
+        nodes: &[NodeRecord],
+        auth: &AuthContext,
+        allow_remote: bool,
+    ) -> Result<Option<DistributedPlacement>> {
+        let mut best: Option<DistributedPlacement> = None;
+        for variant in &manifest.variants {
+            let Some(distributed) = &variant.distributed else {
+                continue;
+            };
+            let mut candidates = nodes
+                .iter()
+                .filter(|node| node.status == common::v1::NodeStatus::Online as i32)
+                .filter(|node| {
+                    let pool = pool_label(&node.capabilities);
+                    auth.allowed_node_pools.is_empty() || auth.allowed_node_pools.contains(&pool)
+                })
+                .filter(|node| allow_remote || !is_remote_pool(&node.capabilities))
+                .filter(|node| {
+                    variant_supports_node_runtime_and_accelerator(
+                        variant,
+                        &node.capabilities,
+                        &supported_accelerators(&node.capabilities),
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                pool_label(&left.capabilities)
+                    .cmp(&pool_label(&right.capabilities))
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            });
+            let preferred_shards = distributed
+                .preferred_shards
+                .max(distributed.min_shards)
+                .max(1);
+            let max_shards = distributed.max_shards.max(preferred_shards).max(1);
+            let max_candidates = candidates.len() as u32;
+            for shard_count in
+                (distributed.min_shards.max(1)..=max_shards.min(max_candidates)).rev()
+            {
+                let shard_count = shard_count
+                    .min(preferred_shards)
+                    .max(distributed.min_shards.max(1));
+                let memory_budget_bytes = variant_memory_budget_bytes(variant, shard_count);
+                let eligible = candidates
+                    .iter()
+                    .filter(|node| {
+                        node_available_memory_bytes(&node.capabilities) >= memory_budget_bytes
+                    })
+                    .take(shard_count as usize)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if eligible.len() < shard_count as usize {
+                    continue;
+                }
+                let shards = eligible
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, node)| ShardPlacement {
+                        pool: pool_label(&node.capabilities),
+                        node,
+                        shard_index: index as u32,
+                        shard_count,
+                        is_coordinator: index == 0,
+                        backend_family: distributed.backend_family.clone(),
+                        memory_budget_bytes,
+                        variant: variant.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let candidate = DistributedPlacement {
+                    backend_family: distributed.backend_family.clone(),
+                    runtime: variant.runtime.clone(),
+                    quantization: variant.quantization.clone(),
+                    shard_count,
+                    shards,
+                    variant: variant.clone(),
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|existing| candidate.shard_count > existing.shard_count)
+                {
+                    best = Some(candidate);
+                }
+                break;
+            }
+        }
+        Ok(best)
     }
 }
 
 impl Scheduler {
-    async fn select_node(
+    async fn select_single_node(
         &self,
         pools: &BTreeMap<String, Vec<(NodeRecord, common::v1::ModelVariant)>>,
-    ) -> Result<PlacementDecision> {
+    ) -> Result<SingleNodePlacement> {
         let selection_key = pools.keys().cloned().collect::<Vec<_>>().join("|");
         let entries = pools
             .iter()
@@ -282,7 +452,7 @@ impl Scheduler {
         let cursor = cursors.entry(selection_key).or_insert(0);
         let selected = entries[*cursor % entries.len()].clone();
         *cursor = (*cursor + 1) % entries.len();
-        Ok(PlacementDecision {
+        Ok(SingleNodePlacement {
             pool: selected.0,
             node: selected.1,
             variant: selected.2,
@@ -763,68 +933,240 @@ where
         let state = self.store.get_state().await?;
         let nodes = state.nodes.values().cloned().collect::<Vec<_>>();
         let placement = self.placement.place_model(&manifest, &nodes, auth).await?;
+        let (execution_node, instance) = match placement {
+            PlacementDecision::Single(placement) => {
+                let instance = if let Some(instance) = state.instances.values().find(|instance| {
+                    instance.node_id == placement.node.node_id
+                        && instance.model_id == request.model
+                        && instance.runtime == placement.variant.runtime
+                        && instance.group_id.is_none()
+                        && instance.status == InstanceStatus::Ready
+                }) {
+                    instance.clone()
+                } else {
+                    let loaded = self
+                        .executor
+                        .load_model(
+                            &placement.node.agent_endpoint,
+                            node::v1::LoadModelRequest {
+                                model_id: Some(common::v1::ModelId {
+                                    value: request.model.clone(),
+                                }),
+                                variant_runtime: placement.variant.runtime.clone(),
+                                variant_quantization: placement.variant.quantization.clone(),
+                                max_memory_bytes: placement.variant.size_bytes,
+                                distributed: None,
+                            },
+                        )
+                        .await?;
+                    let instance = ModelInstanceRecord {
+                        instance_id: loaded
+                            .instance_id
+                            .as_ref()
+                            .map(|instance_id| instance_id.value.clone())
+                            .ok_or_else(|| {
+                                GalacticaError::internal("node agent did not return an instance_id")
+                            })?,
+                        model_id: request.model.clone(),
+                        node_id: placement.node.node_id.clone(),
+                        runtime: placement.variant.runtime.clone(),
+                        quantization: placement.variant.quantization.clone(),
+                        memory_used_bytes: placement.variant.size_bytes,
+                        group_id: None,
+                        shard_index: None,
+                        shard_count: None,
+                        is_coordinator: false,
+                        backend_family: None,
+                        status: InstanceStatus::Loading,
+                        updated_at: Utc::now(),
+                    };
+                    self.store
+                        .apply_event(ControlEvent::InstanceCreated {
+                            instance: instance.clone(),
+                        })
+                        .await?;
+                    self.store
+                        .apply_event(ControlEvent::InstanceStatusChanged {
+                            instance_id: instance.instance_id.clone(),
+                            status: InstanceStatus::Ready,
+                        })
+                        .await?;
+                    self.audit(
+                        "control-plane",
+                        "model.load",
+                        format!("instance:{}", instance.instance_id),
+                        "success",
+                        BTreeMap::from([
+                            ("model_id".to_string(), instance.model_id.clone()),
+                            ("node_id".to_string(), instance.node_id.clone()),
+                        ]),
+                    )
+                    .await?;
+                    instance
+                };
+                (placement.node, instance)
+            }
+            PlacementDecision::Distributed(placement) => {
+                let existing = state
+                    .groups
+                    .values()
+                    .find(|group| {
+                        group.model_id == request.model
+                            && group.runtime == placement.runtime
+                            && group.quantization == placement.quantization
+                            && group.backend_family == placement.backend_family
+                            && group.shard_count == placement.shard_count
+                    })
+                    .and_then(|group| {
+                        state
+                            .instances
+                            .values()
+                            .find(|instance| {
+                                instance.group_id.as_deref() == Some(group.group_id.as_str())
+                                    && instance.is_coordinator
+                                    && instance.status == InstanceStatus::Ready
+                            })
+                            .and_then(|instance| {
+                                state
+                                    .nodes
+                                    .get(&instance.node_id)
+                                    .cloned()
+                                    .map(|node| (node, instance.clone()))
+                            })
+                    });
+                if let Some(existing) = existing {
+                    existing
+                } else {
+                    let group_id = format!("group-{}", uuid::Uuid::new_v4());
+                    let shard_assignments = placement
+                        .shards
+                        .iter()
+                        .map(|shard| common::v1::ShardAssignment {
+                            node_id: Some(common::v1::NodeId {
+                                value: shard.node.node_id.clone(),
+                            }),
+                            shard_index: shard.shard_index,
+                            shard_count: shard.shard_count,
+                            is_coordinator: shard.is_coordinator,
+                            backend_family: shard.backend_family.clone(),
+                            memory_budget_bytes: shard.memory_budget_bytes,
+                            agent_endpoint: shard.node.agent_endpoint.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    self.store
+                        .apply_event(ControlEvent::GroupCreated {
+                            group: DistributedGroupRecord {
+                                group_id: group_id.clone(),
+                                model_id: request.model.clone(),
+                                runtime: placement.runtime.clone(),
+                                quantization: placement.quantization.clone(),
+                                backend_family: placement.backend_family.clone(),
+                                coordinator_node_id: placement.coordinator().node.node_id.clone(),
+                                shard_count: placement.shard_count,
+                                node_ids: placement
+                                    .shards
+                                    .iter()
+                                    .map(|shard| shard.node.node_id.clone())
+                                    .collect(),
+                                updated_at: Utc::now(),
+                            },
+                        })
+                        .await?;
 
-        let instance = if let Some(instance) = state.instances.values().find(|instance| {
-            instance.node_id == placement.node.node_id
-                && instance.model_id == request.model
-                && instance.runtime == placement.variant.runtime
-                && instance.status == InstanceStatus::Ready
-        }) {
-            instance.clone()
-        } else {
-            let loaded = self
-                .executor
-                .load_model(
-                    &placement.node.agent_endpoint,
-                    node::v1::LoadModelRequest {
-                        model_id: Some(common::v1::ModelId {
-                            value: request.model.clone(),
-                        }),
-                        variant_runtime: placement.variant.runtime.clone(),
-                        variant_quantization: placement.variant.quantization.clone(),
-                        max_memory_bytes: placement.variant.size_bytes,
-                    },
-                )
-                .await?;
-            let instance = ModelInstanceRecord {
-                instance_id: loaded
-                    .instance_id
-                    .as_ref()
-                    .map(|instance_id| instance_id.value.clone())
-                    .ok_or_else(|| {
-                        GalacticaError::internal("node agent did not return an instance_id")
-                    })?,
-                model_id: request.model.clone(),
-                node_id: placement.node.node_id.clone(),
-                runtime: placement.variant.runtime.clone(),
-                quantization: placement.variant.quantization.clone(),
-                memory_used_bytes: placement.variant.size_bytes,
-                status: InstanceStatus::Loading,
-                updated_at: Utc::now(),
-            };
-            self.store
-                .apply_event(ControlEvent::InstanceCreated {
-                    instance: instance.clone(),
-                })
-                .await?;
-            self.store
-                .apply_event(ControlEvent::InstanceStatusChanged {
-                    instance_id: instance.instance_id.clone(),
-                    status: InstanceStatus::Ready,
-                })
-                .await?;
-            self.audit(
-                "control-plane",
-                "model.load",
-                format!("instance:{}", instance.instance_id),
-                "success",
-                BTreeMap::from([
-                    ("model_id".to_string(), instance.model_id.clone()),
-                    ("node_id".to_string(), instance.node_id.clone()),
-                ]),
-            )
-            .await?;
-            instance
+                    let mut coordinator: Option<(NodeRecord, ModelInstanceRecord)> = None;
+                    for shard in &placement.shards {
+                        let distributed_runtime_options = HashMap::from([(
+                            "tensor_parallel_size".to_string(),
+                            placement.shard_count.to_string(),
+                        )]);
+                        let loaded = self
+                            .executor
+                            .load_model(
+                                &shard.node.agent_endpoint,
+                                node::v1::LoadModelRequest {
+                                    model_id: Some(common::v1::ModelId {
+                                        value: request.model.clone(),
+                                    }),
+                                    variant_runtime: placement.runtime.clone(),
+                                    variant_quantization: placement.quantization.clone(),
+                                    max_memory_bytes: shard.memory_budget_bytes,
+                                    distributed: Some(node::v1::DistributedGroupSpec {
+                                        group_id: group_id.clone(),
+                                        backend_family: placement.backend_family.clone(),
+                                        shard_index: shard.shard_index,
+                                        shard_count: placement.shard_count,
+                                        is_coordinator: shard.is_coordinator,
+                                        shard_assignments: shard_assignments.clone(),
+                                        runtime_options: distributed_runtime_options,
+                                    }),
+                                },
+                            )
+                            .await?;
+                        let instance = ModelInstanceRecord {
+                            instance_id: loaded
+                                .instance_id
+                                .as_ref()
+                                .map(|instance_id| instance_id.value.clone())
+                                .ok_or_else(|| {
+                                    GalacticaError::internal(
+                                        "node agent did not return an instance_id",
+                                    )
+                                })?,
+                            model_id: request.model.clone(),
+                            node_id: shard.node.node_id.clone(),
+                            runtime: placement.runtime.clone(),
+                            quantization: placement.quantization.clone(),
+                            memory_used_bytes: shard.memory_budget_bytes,
+                            group_id: Some(group_id.clone()),
+                            shard_index: Some(shard.shard_index),
+                            shard_count: Some(placement.shard_count),
+                            is_coordinator: shard.is_coordinator,
+                            backend_family: Some(placement.backend_family.clone()),
+                            status: InstanceStatus::Loading,
+                            updated_at: Utc::now(),
+                        };
+                        self.store
+                            .apply_event(ControlEvent::InstanceCreated {
+                                instance: instance.clone(),
+                            })
+                            .await?;
+                        self.store
+                            .apply_event(ControlEvent::InstanceStatusChanged {
+                                instance_id: instance.instance_id.clone(),
+                                status: InstanceStatus::Ready,
+                            })
+                            .await?;
+                        if shard.is_coordinator {
+                            coordinator = Some((shard.node.clone(), instance));
+                        }
+                    }
+                    let coordinator = coordinator.ok_or_else(|| {
+                        GalacticaError::internal(
+                            "distributed placement did not produce a coordinator instance",
+                        )
+                    })?;
+                    self.audit(
+                        "control-plane",
+                        "model.load",
+                        format!("group:{group_id}"),
+                        "success",
+                        BTreeMap::from([
+                            ("model_id".to_string(), request.model.clone()),
+                            (
+                                "backend_family".to_string(),
+                                placement.backend_family.clone(),
+                            ),
+                            (
+                                "coordinator_node_id".to_string(),
+                                coordinator.0.node_id.clone(),
+                            ),
+                            ("shard_count".to_string(), placement.shard_count.to_string()),
+                        ]),
+                    )
+                    .await?;
+                    coordinator
+                }
+            }
         };
 
         let prompt = request.prompt();
@@ -835,7 +1177,7 @@ where
                     task_id: task_id.clone(),
                     request_id: request.request_id.clone(),
                     model_id: request.model.clone(),
-                    node_id: placement.node.node_id.clone(),
+                    node_id: execution_node.node_id.clone(),
                     instance_id: instance.instance_id.clone(),
                     prompt: prompt.clone(),
                     status: common::v1::TaskStatus::Pending as i32,
@@ -858,7 +1200,7 @@ where
         let execution = self
             .executor
             .execute_task(
-                &placement.node.agent_endpoint,
+                &execution_node.agent_endpoint,
                 node::v1::ExecuteTaskRequest {
                     task_id: Some(common::v1::TaskId {
                         value: task_id.clone(),
@@ -901,6 +1243,7 @@ where
                 "failed",
                 BTreeMap::from([
                     ("request_id".to_string(), request.request_id.clone()),
+                    ("node_id".to_string(), execution_node.node_id.clone()),
                     (
                         "error".to_string(),
                         error_message
@@ -947,8 +1290,8 @@ where
             BTreeMap::from([
                 ("request_id".to_string(), request.request_id),
                 ("model_id".to_string(), request.model),
-                ("node_id".to_string(), placement.node.node_id),
-                ("pool".to_string(), placement.pool),
+                ("node_id".to_string(), execution_node.node_id.clone()),
+                ("pool".to_string(), pool_label(&execution_node.capabilities)),
             ]),
         )
         .await?;
@@ -1103,6 +1446,10 @@ where
                             value: instance.node_id.clone(),
                         }),
                         runtime: instance.runtime.clone(),
+                        group_id: instance.group_id.clone().unwrap_or_default(),
+                        shard_index: instance.shard_index.unwrap_or_default(),
+                        is_coordinator: instance.is_coordinator,
+                        backend_family: instance.backend_family.clone().unwrap_or_default(),
                     })
                     .collect(),
             }))
@@ -1550,9 +1897,12 @@ fn validate_signed_token(
 mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
     use futures::StreamExt;
-    use galactica_artifact::LocalModelRegistry;
+    use galactica_artifact::{LocalModelRegistry, ModelRegistry};
+    use galactica_common::inference::{ChatTurn, InferenceParameters, InferenceRequest};
     use galactica_common::proto::control::v1::control_plane_server::ControlPlane;
     use galactica_common::proto::gateway::v1::{ChatMessage, InferenceParams};
     use galactica_common::proto::node::v1::node_agent_server::NodeAgentServer;
@@ -1560,6 +1910,7 @@ mod tests {
         MlxBackend, NodeAgentService, default_macos_capabilities, default_system_memory,
     };
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
@@ -1636,6 +1987,143 @@ mod tests {
         }
     }
 
+    fn sample_macos_llama_cpp_node(node_id: &str) -> NodeRecord {
+        let mut node = sample_node(node_id);
+        node.capabilities.runtime_backends = vec!["mlx".to_string(), "llama.cpp".to_string()];
+        node
+    }
+
+    fn distributed_qwen_manifest() -> common::v1::ModelManifest {
+        common::v1::ModelManifest {
+            model_id: Some(common::v1::ModelId {
+                value: "qwen3.5-27b".to_string(),
+            }),
+            name: "Qwen3.5 27B".to_string(),
+            family: "chat".to_string(),
+            variants: vec![common::v1::ModelVariant {
+                runtime: "llama.cpp".to_string(),
+                quantization: "q4_k_m".to_string(),
+                format: "gguf".to_string(),
+                size_bytes: 18 * 1024 * 1024 * 1024,
+                compatible_accelerators: vec![
+                    common::v1::AcceleratorType::Cuda as i32,
+                    common::v1::AcceleratorType::Metal as i32,
+                ],
+                distributed: Some(common::v1::DistributedExecutionPolicy {
+                    backend_family: "llama.cpp".to_string(),
+                    min_shards: 2,
+                    max_shards: 4,
+                    preferred_shards: 2,
+                    per_shard_overhead_bytes: 512 * 1024 * 1024,
+                    requires_homogeneous_backend: true,
+                    supports_generation: true,
+                    supports_embedding: true,
+                }),
+            }],
+            chat_template: "chatml".to_string(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticRegistry {
+        manifest: common::v1::ModelManifest,
+    }
+
+    #[async_trait]
+    impl ModelRegistry for StaticRegistry {
+        async fn get_model_manifest(&self, model_id: &str) -> Result<common::v1::ModelManifest> {
+            if self
+                .manifest
+                .model_id
+                .as_ref()
+                .is_some_and(|candidate| candidate.value == model_id)
+            {
+                Ok(self.manifest.clone())
+            } else {
+                Err(GalacticaError::not_found(format!(
+                    "model manifest not found: {model_id}"
+                )))
+            }
+        }
+
+        async fn list_models(
+            &self,
+            _filter_runtime: Option<&str>,
+            _filter_family: Option<&str>,
+        ) -> Result<Vec<common::v1::ModelManifest>> {
+            Ok(vec![self.manifest.clone()])
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedLoad {
+        endpoint: String,
+        request: node::v1::LoadModelRequest,
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        load_requests: Mutex<Vec<RecordedLoad>>,
+        execute_requests: Mutex<Vec<(String, node::v1::ExecuteTaskRequest)>>,
+        next_instance: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl NodeExecutor for RecordingExecutor {
+        async fn load_model(
+            &self,
+            endpoint: &str,
+            request: node::v1::LoadModelRequest,
+        ) -> Result<node::v1::LoadModelResponse> {
+            self.load_requests.lock().await.push(RecordedLoad {
+                endpoint: endpoint.to_string(),
+                request: request.clone(),
+            });
+            let mut counter = self.next_instance.lock().await;
+            *counter += 1;
+            Ok(node::v1::LoadModelResponse {
+                instance_id: Some(common::v1::InstanceId {
+                    value: format!("inst-{}", *counter),
+                }),
+                success: true,
+                error_message: String::new(),
+                group_id: request
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.group_id.clone())
+                    .unwrap_or_default(),
+                shard_index: request
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.shard_index)
+                    .unwrap_or_default(),
+                is_coordinator: request
+                    .distributed
+                    .as_ref()
+                    .map(|distributed| distributed.is_coordinator)
+                    .unwrap_or(false),
+            })
+        }
+
+        async fn execute_task(
+            &self,
+            endpoint: &str,
+            request: node::v1::ExecuteTaskRequest,
+        ) -> Result<node::v1::ExecuteTaskResponse> {
+            self.execute_requests
+                .lock()
+                .await
+                .push((endpoint.to_string(), request.clone()));
+            Ok(node::v1::ExecuteTaskResponse {
+                task_id: request.task_id,
+                status: common::v1::TaskStatus::Completed as i32,
+                result: b"distributed response".to_vec(),
+                error_message: String::new(),
+            })
+        }
+    }
+
     #[test]
     fn execution_pools_group_heterogeneous_nodes() {
         let pools = compute_execution_pools(&[
@@ -1687,6 +2175,7 @@ mod tests {
                 format: "safetensors".to_string(),
                 size_bytes: 1024,
                 compatible_accelerators: vec![common::v1::AcceleratorType::Metal as i32],
+                distributed: None,
             }],
             chat_template: "chatml".to_string(),
             metadata: HashMap::new(),
@@ -1716,7 +2205,14 @@ mod tests {
             .place_model(&manifest, &[remote, local.clone()], &auth)
             .await
             .unwrap();
-        assert_eq!(decision.node.node_id, local.node_id);
+        match decision {
+            PlacementDecision::Single(placement) => {
+                assert_eq!(placement.node.node_id, local.node_id);
+            }
+            PlacementDecision::Distributed(_) => {
+                panic!("expected single-node placement for local mlx variant");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1737,6 +2233,7 @@ mod tests {
                     format: "mlx".to_string(),
                     size_bytes: 2 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![common::v1::AcceleratorType::Metal as i32],
+                    distributed: None,
                 },
                 common::v1::ModelVariant {
                     runtime: "llama.cpp".to_string(),
@@ -1747,6 +2244,7 @@ mod tests {
                         common::v1::AcceleratorType::Cpu as i32,
                         common::v1::AcceleratorType::Cuda as i32,
                     ],
+                    distributed: None,
                 },
             ],
             chat_template: "chatml".to_string(),
@@ -1775,13 +2273,212 @@ mod tests {
             .place_model(&manifest, &[mac, windows], &auth)
             .await
             .unwrap();
+        let (first_pool, first_node) = match first {
+            PlacementDecision::Single(placement) => (placement.pool, placement.node.node_id),
+            PlacementDecision::Distributed(_) => {
+                panic!("expected single-node placement for qwen3.5-4b");
+            }
+        };
+        let (second_pool, second_node) = match second {
+            PlacementDecision::Single(placement) => (placement.pool, placement.node.node_id),
+            PlacementDecision::Distributed(_) => {
+                panic!("expected single-node placement for qwen3.5-4b");
+            }
+        };
 
-        assert_ne!(first.node.node_id, second.node.node_id);
+        assert_ne!(first_node, second_node);
         assert!(matches!(
-            (first.pool.as_str(), second.pool.as_str()),
+            (first_pool.as_str(), second_pool.as_str()),
             ("macos-metal-arm64", "windows-cuda-x86_64")
                 | ("windows-cuda-x86_64", "macos-metal-arm64")
         ));
+    }
+
+    #[tokio::test]
+    async fn placement_engine_builds_distributed_group_when_model_needs_shards() {
+        let engine = DefaultPlacementEngine::default();
+        let auth = AuthContext {
+            tenant_id: "tenant-dev".to_string(),
+            scopes: vec!["inference:write".to_string()],
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            require_mtls: false,
+            max_requests_per_minute: 120,
+            allowed_models: vec!["qwen3.5-27b".to_string()],
+            allowed_node_pools: vec![
+                "macos-metal-arm64".to_string(),
+                "windows-cuda-x86_64".to_string(),
+            ],
+            actor: "tenant:tenant-dev".to_string(),
+            credential_kind: CredentialKind::ApiKey,
+        };
+
+        let decision = engine
+            .place_model(
+                &distributed_qwen_manifest(),
+                &[
+                    sample_macos_llama_cpp_node("mac-node"),
+                    sample_windows_cuda_node("windows-node"),
+                ],
+                &auth,
+            )
+            .await
+            .unwrap();
+
+        let placement = match decision {
+            PlacementDecision::Distributed(placement) => placement,
+            PlacementDecision::Single(_) => {
+                panic!("expected distributed placement for qwen3.5-27b");
+            }
+        };
+
+        assert_eq!(placement.runtime, "llama.cpp");
+        assert_eq!(placement.backend_family, "llama.cpp");
+        assert_eq!(placement.shard_count, 2);
+        assert_eq!(placement.shards.len(), 2);
+        assert_eq!(
+            placement
+                .shards
+                .iter()
+                .filter(|shard| shard.is_coordinator)
+                .count(),
+            1
+        );
+        assert!(
+            placement
+                .shards
+                .iter()
+                .all(|shard| shard.memory_budget_bytes <= 10 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_once_reuses_existing_distributed_group() {
+        let store = Arc::new(InMemoryStateStore::default());
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = ControlPlaneService::new(
+            store.clone(),
+            Arc::new(StaticRegistry {
+                manifest: distributed_qwen_manifest(),
+            }),
+            executor.clone(),
+        );
+        service.seed_tenant(sample_tenant()).await.unwrap();
+        store
+            .upsert_tenant(TenantRecord {
+                tenant_id: "tenant-dev".to_string(),
+                api_key: "galactica-dev-key".to_string(),
+                scopes: vec!["inference:read".to_string(), "inference:write".to_string()],
+                require_mtls: false,
+                max_requests_per_minute: 120,
+                allowed_models: vec!["qwen3.5-27b".to_string()],
+                allowed_node_pools: vec![
+                    "macos-metal-arm64".to_string(),
+                    "windows-cuda-x86_64".to_string(),
+                ],
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .apply_event(ControlEvent::NodeRegistered {
+                node: sample_macos_llama_cpp_node("mac-node"),
+            })
+            .await
+            .unwrap();
+        store
+            .apply_event(ControlEvent::NodeRegistered {
+                node: sample_windows_cuda_node("windows-node"),
+            })
+            .await
+            .unwrap();
+
+        let auth = AuthContext {
+            tenant_id: "tenant-dev".to_string(),
+            scopes: vec!["inference:write".to_string()],
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            require_mtls: false,
+            max_requests_per_minute: 120,
+            allowed_models: vec!["qwen3.5-27b".to_string()],
+            allowed_node_pools: vec![
+                "macos-metal-arm64".to_string(),
+                "windows-cuda-x86_64".to_string(),
+            ],
+            actor: "tenant:tenant-dev".to_string(),
+            credential_kind: CredentialKind::ApiKey,
+        };
+        let request = InferenceRequest {
+            request_id: "req-1".to_string(),
+            model: "qwen3.5-27b".to_string(),
+            messages: vec![ChatTurn {
+                role: "user".to_string(),
+                content: "summarize cluster state".to_string(),
+            }],
+            params: InferenceParameters::default(),
+        };
+
+        let first = service.infer_once(request.clone(), &auth).await.unwrap();
+        let second = service.infer_once(request, &auth).await.unwrap();
+
+        let first_output = first
+            .iter()
+            .map(|chunk| chunk.delta_content.as_str())
+            .collect::<String>();
+        let second_output = second
+            .iter()
+            .map(|chunk| chunk.delta_content.as_str())
+            .collect::<String>();
+        assert_eq!(first_output, "distributed response");
+        assert_eq!(second_output, "distributed response");
+
+        let load_requests = executor.load_requests.lock().await;
+        assert_eq!(load_requests.len(), 2);
+        assert!(
+            load_requests
+                .iter()
+                .all(|load| load.request.distributed.is_some())
+        );
+        let group_id = load_requests[0]
+            .request
+            .distributed
+            .as_ref()
+            .unwrap()
+            .group_id
+            .clone();
+        assert!(!group_id.is_empty());
+        assert!(load_requests.iter().all(|load| {
+            load.request
+                .distributed
+                .as_ref()
+                .is_some_and(|distributed| distributed.group_id == group_id)
+        }));
+        let load_endpoints = load_requests
+            .iter()
+            .map(|load| load.endpoint.as_str())
+            .collect::<Vec<_>>();
+        assert!(load_endpoints.contains(&"http://127.0.0.1:50061"));
+        assert!(load_endpoints.contains(&"http://127.0.0.1:50062"));
+        drop(load_requests);
+
+        let execute_requests = executor.execute_requests.lock().await;
+        assert_eq!(execute_requests.len(), 2);
+        assert!(
+            execute_requests
+                .iter()
+                .all(|(endpoint, _)| endpoint == "http://127.0.0.1:50061")
+        );
+        drop(execute_requests);
+
+        let state = store.get_state().await.unwrap();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.instances.len(), 2);
+        assert_eq!(
+            state
+                .instances
+                .values()
+                .filter(|instance| instance.is_coordinator)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

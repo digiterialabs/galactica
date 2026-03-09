@@ -114,6 +114,10 @@ message LoadedModel {
   galactica.common.v1.ModelId model_id = 2;
   galactica.common.v1.NodeId node_id = 3;
   string runtime = 4;
+  string group_id = 5;
+  uint32 shard_index = 6;
+  bool is_coordinator = 7;
+  string backend_family = 8;
 }
 
 message ListAuditRecordsRequest {

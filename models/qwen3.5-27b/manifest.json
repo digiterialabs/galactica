@@ -1,0 +1,36 @@
+{
+  "model_id": "qwen3.5-27b",
+  "name": "Qwen3.5 27B",
+  "family": "chat",
+  "variants": [
+    {
+      "runtime": "llama.cpp",
+      "quantization": "q4_k_m",
+      "format": "gguf",
+      "size_bytes": 19327352832,
+      "compatible_accelerators": [
+        1,
+        2,
+        3
+      ],
+      "distributed": {
+        "backend_family": "llama.cpp",
+        "min_shards": 2,
+        "max_shards": 4,
+        "preferred_shards": 2,
+        "per_shard_overhead_bytes": 536870912,
+        "requires_homogeneous_backend": true,
+        "supports_generation": true,
+        "supports_embedding": true
+      }
+    }
+  ],
+  "chat_template": "chatml",
+  "metadata": {
+    "source_model_id": "Qwen/Qwen3.5-27B",
+    "llama_cpp_hf_repo": "bartowski/Qwen_Qwen3.5-27B-GGUF",
+    "llama_cpp_hf_file": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+    "context_size": "8192",
+    "reasoning_budget": "0"
+  }
+}

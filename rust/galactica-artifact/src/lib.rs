@@ -82,7 +82,7 @@ impl LocalModelRegistry {
                 path.display()
             ))
         })?;
-        Ok(manifest.into_manifest())
+        validate_manifest(manifest.into_manifest())
     }
 }
 
@@ -204,6 +204,20 @@ struct StoredVariant {
     format: String,
     size_bytes: u64,
     compatible_accelerators: Vec<i32>,
+    #[serde(default)]
+    distributed: Option<StoredDistributedExecutionPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDistributedExecutionPolicy {
+    backend_family: String,
+    min_shards: u32,
+    max_shards: u32,
+    preferred_shards: u32,
+    per_shard_overhead_bytes: u64,
+    requires_homogeneous_backend: bool,
+    supports_generation: bool,
+    supports_embedding: bool,
 }
 
 impl StoredVariant {
@@ -214,6 +228,18 @@ impl StoredVariant {
             format: self.format,
             size_bytes: self.size_bytes,
             compatible_accelerators: self.compatible_accelerators,
+            distributed: self.distributed.map(|distributed| {
+                common::v1::DistributedExecutionPolicy {
+                    backend_family: distributed.backend_family,
+                    min_shards: distributed.min_shards,
+                    max_shards: distributed.max_shards,
+                    preferred_shards: distributed.preferred_shards,
+                    per_shard_overhead_bytes: distributed.per_shard_overhead_bytes,
+                    requires_homogeneous_backend: distributed.requires_homogeneous_backend,
+                    supports_generation: distributed.supports_generation,
+                    supports_embedding: distributed.supports_embedding,
+                }
+            }),
         }
     }
 }
@@ -226,8 +252,75 @@ impl From<&common::v1::ModelVariant> for StoredVariant {
             format: value.format.clone(),
             size_bytes: value.size_bytes,
             compatible_accelerators: value.compatible_accelerators.clone(),
+            distributed: value.distributed.as_ref().map(|distributed| {
+                StoredDistributedExecutionPolicy {
+                    backend_family: distributed.backend_family.clone(),
+                    min_shards: distributed.min_shards,
+                    max_shards: distributed.max_shards,
+                    preferred_shards: distributed.preferred_shards,
+                    per_shard_overhead_bytes: distributed.per_shard_overhead_bytes,
+                    requires_homogeneous_backend: distributed.requires_homogeneous_backend,
+                    supports_generation: distributed.supports_generation,
+                    supports_embedding: distributed.supports_embedding,
+                }
+            }),
         }
     }
+}
+
+fn validate_manifest(manifest: common::v1::ModelManifest) -> Result<common::v1::ModelManifest> {
+    let model_id = manifest_id(&manifest);
+    if model_id.is_empty() {
+        return Err(GalacticaError::invalid_argument(
+            "model manifest must define model_id",
+        ));
+    }
+    if manifest.variants.is_empty() {
+        return Err(GalacticaError::invalid_argument(format!(
+            "model manifest {model_id} must define at least one variant"
+        )));
+    }
+    for variant in &manifest.variants {
+        if variant.runtime.trim().is_empty() {
+            return Err(GalacticaError::invalid_argument(format!(
+                "model manifest {model_id} contains a variant without runtime"
+            )));
+        }
+        if variant.quantization.trim().is_empty() {
+            return Err(GalacticaError::invalid_argument(format!(
+                "model manifest {model_id} contains a variant without quantization"
+            )));
+        }
+        if let Some(distributed) = &variant.distributed {
+            if distributed.backend_family.trim().is_empty() {
+                return Err(GalacticaError::invalid_argument(format!(
+                    "distributed variant {}:{} in {model_id} must define backend_family",
+                    variant.runtime, variant.quantization
+                )));
+            }
+            if distributed.min_shards == 0 {
+                return Err(GalacticaError::invalid_argument(format!(
+                    "distributed variant {}:{} in {model_id} must use min_shards >= 1",
+                    variant.runtime, variant.quantization
+                )));
+            }
+            if distributed.max_shards < distributed.min_shards {
+                return Err(GalacticaError::invalid_argument(format!(
+                    "distributed variant {}:{} in {model_id} must use max_shards >= min_shards",
+                    variant.runtime, variant.quantization
+                )));
+            }
+            if distributed.preferred_shards < distributed.min_shards
+                || distributed.preferred_shards > distributed.max_shards
+            {
+                return Err(GalacticaError::invalid_argument(format!(
+                    "distributed variant {}:{} in {model_id} must keep preferred_shards within min/max shard bounds",
+                    variant.runtime, variant.quantization
+                )));
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 #[async_trait]
@@ -266,7 +359,7 @@ impl ModelRegistry for HuggingFaceRegistry {
                 .unwrap_or_else(|| "text-generation".to_string())
         });
 
-        Ok(common::v1::ModelManifest {
+        validate_manifest(common::v1::ModelManifest {
             model_id: Some(common::v1::ModelId {
                 value: payload.id.clone(),
             }),
@@ -279,6 +372,7 @@ impl ModelRegistry for HuggingFaceRegistry {
                     format: "safetensors".to_string(),
                     size_bytes: 4 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![common::v1::AcceleratorType::Metal as i32],
+                    distributed: None,
                 },
                 common::v1::ModelVariant {
                     runtime: "llama.cpp".to_string(),
@@ -286,6 +380,7 @@ impl ModelRegistry for HuggingFaceRegistry {
                     format: "gguf".to_string(),
                     size_bytes: 4 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![common::v1::AcceleratorType::Cpu as i32],
+                    distributed: None,
                 },
             ],
             chat_template: "default".to_string(),
@@ -349,7 +444,36 @@ pub fn resolve_variant(
     manifest: &common::v1::ModelManifest,
     capabilities: &common::v1::NodeCapabilities,
 ) -> Result<common::v1::ModelVariant> {
-    let available_memory = capabilities
+    let available_memory = node_available_memory_bytes(capabilities);
+    let supported_accelerators: Vec<i32> = supported_accelerators(capabilities);
+
+    manifest
+        .variants
+        .iter()
+        .filter(|variant| variant_min_shards(variant) <= 1)
+        .filter(|variant| {
+            variant_supports_node_runtime_and_accelerator(
+                variant,
+                capabilities,
+                &supported_accelerators,
+            )
+        })
+        .filter(|variant| {
+            available_memory == 0 || variant_memory_budget_bytes(variant, 1) <= available_memory
+        })
+        .max_by_key(|variant| variant_score(variant, &supported_accelerators, capabilities))
+        .cloned()
+        .ok_or_else(|| {
+            GalacticaError::failed_precondition(format!(
+                "no compatible variants available for {}",
+                manifest_id(manifest)
+            ))
+        })
+}
+
+pub fn node_available_memory_bytes(capabilities: &common::v1::NodeCapabilities) -> u64 {
+    let supported = supported_accelerators(capabilities);
+    let system_budget = capabilities
         .system_memory
         .as_ref()
         .map(|memory| {
@@ -360,38 +484,79 @@ pub fn resolve_variant(
             }
         })
         .unwrap_or(0);
-    let supported_accelerators: Vec<i32> = capabilities
+    let accelerator_budget = capabilities
+        .accelerators
+        .iter()
+        .filter(|accelerator| {
+            supported.contains(&accelerator.r#type)
+                && accelerator
+                    .vram
+                    .as_ref()
+                    .is_some_and(|memory| memory.total_bytes > 0 || memory.available_bytes > 0)
+        })
+        .filter_map(|accelerator| accelerator.vram.as_ref())
+        .map(|memory| {
+            if memory.available_bytes == 0 {
+                memory.total_bytes
+            } else {
+                memory.available_bytes
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    if common::v1::OsType::try_from(capabilities.os).unwrap_or_default()
+        == common::v1::OsType::Macos
+        && has_accelerator(capabilities, common::v1::AcceleratorType::Metal)
+    {
+        return accelerator_budget.max(system_budget);
+    }
+    if accelerator_budget > 0 {
+        return accelerator_budget;
+    }
+    system_budget
+}
+
+pub fn supported_accelerators(capabilities: &common::v1::NodeCapabilities) -> Vec<i32> {
+    capabilities
         .accelerators
         .iter()
         .map(|accelerator| accelerator.r#type)
-        .collect();
+        .collect()
+}
 
-    manifest
-        .variants
-        .iter()
-        .filter(|variant| {
-            capabilities.runtime_backends.is_empty()
-                || capabilities
-                    .runtime_backends
-                    .iter()
-                    .any(|runtime| runtime == &variant.runtime)
-        })
-        .filter(|variant| {
-            variant.compatible_accelerators.is_empty()
-                || variant
-                    .compatible_accelerators
-                    .iter()
-                    .any(|accelerator| supported_accelerators.contains(accelerator))
-        })
-        .filter(|variant| available_memory == 0 || variant.size_bytes <= available_memory)
-        .max_by_key(|variant| variant_score(variant, &supported_accelerators, capabilities))
-        .cloned()
-        .ok_or_else(|| {
-            GalacticaError::failed_precondition(format!(
-                "no compatible variants available for {}",
-                manifest_id(manifest)
-            ))
-        })
+pub fn variant_min_shards(variant: &common::v1::ModelVariant) -> u32 {
+    variant
+        .distributed
+        .as_ref()
+        .map(|distributed| distributed.min_shards.max(1))
+        .unwrap_or(1)
+}
+
+pub fn variant_memory_budget_bytes(variant: &common::v1::ModelVariant, shard_count: u32) -> u64 {
+    let shard_count = shard_count.max(1) as u64;
+    if let Some(distributed) = &variant.distributed {
+        let per_shard = variant.size_bytes.saturating_add(shard_count - 1) / shard_count;
+        per_shard.saturating_add(distributed.per_shard_overhead_bytes)
+    } else {
+        variant.size_bytes
+    }
+}
+
+pub fn variant_supports_node_runtime_and_accelerator(
+    variant: &common::v1::ModelVariant,
+    capabilities: &common::v1::NodeCapabilities,
+    supported_accelerators: &[i32],
+) -> bool {
+    (capabilities.runtime_backends.is_empty()
+        || capabilities
+            .runtime_backends
+            .iter()
+            .any(|runtime| runtime.eq_ignore_ascii_case(&variant.runtime)))
+        && (variant.compatible_accelerators.is_empty()
+            || variant
+                .compatible_accelerators
+                .iter()
+                .any(|accelerator| supported_accelerators.contains(accelerator)))
 }
 
 fn variant_score(
@@ -682,7 +847,10 @@ mod tests {
         NetworkProfile, NodeCapabilities, OsType,
     };
 
-    use super::{LocalModelRegistry, ModelRegistry, StoredManifest, resolve_variant};
+    use super::{
+        LocalModelRegistry, ModelRegistry, StoredManifest, node_available_memory_bytes,
+        resolve_variant, variant_memory_budget_bytes,
+    };
 
     fn sample_manifest() -> ModelManifest {
         ModelManifest {
@@ -698,6 +866,7 @@ mod tests {
                     format: "safetensors".to_string(),
                     size_bytes: 2 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![AcceleratorType::Metal as i32],
+                    distributed: None,
                 },
                 ModelVariant {
                     runtime: "llama.cpp".to_string(),
@@ -705,6 +874,7 @@ mod tests {
                     format: "gguf".to_string(),
                     size_bytes: 3 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![AcceleratorType::Cpu as i32],
+                    distributed: None,
                 },
             ],
             chat_template: "chatml".to_string(),
@@ -778,6 +948,40 @@ mod tests {
         }
     }
 
+    fn distributed_manifest() -> ModelManifest {
+        ModelManifest {
+            model_id: Some(ModelId {
+                value: "qwen3.5-27b".to_string(),
+            }),
+            name: "Qwen3.5 27B".to_string(),
+            family: "chat".to_string(),
+            variants: vec![ModelVariant {
+                runtime: "llama.cpp".to_string(),
+                quantization: "q4_k_m".to_string(),
+                format: "gguf".to_string(),
+                size_bytes: 18 * 1024 * 1024 * 1024,
+                compatible_accelerators: vec![
+                    AcceleratorType::Cuda as i32,
+                    AcceleratorType::Metal as i32,
+                ],
+                distributed: Some(
+                    galactica_common::proto::common::v1::DistributedExecutionPolicy {
+                        backend_family: "llama.cpp".to_string(),
+                        min_shards: 2,
+                        max_shards: 4,
+                        preferred_shards: 2,
+                        per_shard_overhead_bytes: 512 * 1024 * 1024,
+                        requires_homogeneous_backend: true,
+                        supports_generation: true,
+                        supports_embedding: true,
+                    },
+                ),
+            }],
+            chat_template: "chatml".to_string(),
+            metadata: HashMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn local_registry_scans_manifests() {
         let root =
@@ -819,6 +1023,7 @@ mod tests {
                     format: "mlx".to_string(),
                     size_bytes: 2 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![AcceleratorType::Metal as i32],
+                    distributed: None,
                 },
                 ModelVariant {
                     runtime: "llama.cpp".to_string(),
@@ -829,6 +1034,7 @@ mod tests {
                         AcceleratorType::Cpu as i32,
                         AcceleratorType::Metal as i32,
                     ],
+                    distributed: None,
                 },
             ],
             ..sample_manifest()
@@ -848,6 +1054,7 @@ mod tests {
                     format: "onnx".to_string(),
                     size_bytes: 2 * 1024 * 1024 * 1024,
                     compatible_accelerators: vec![AcceleratorType::Cuda as i32],
+                    distributed: None,
                 },
                 ModelVariant {
                     runtime: "llama.cpp".to_string(),
@@ -858,6 +1065,7 @@ mod tests {
                         AcceleratorType::Cpu as i32,
                         AcceleratorType::Cuda as i32,
                     ],
+                    distributed: None,
                 },
             ],
             ..sample_manifest()
@@ -865,5 +1073,27 @@ mod tests {
 
         let selected = resolve_variant(&manifest, &windows_cuda_capabilities()).unwrap();
         assert_eq!(selected.runtime, "llama.cpp");
+    }
+
+    #[test]
+    fn variant_resolution_ignores_multi_shard_variants_for_single_node_selection() {
+        let selected = resolve_variant(&distributed_manifest(), &windows_cuda_capabilities());
+        assert!(selected.is_err());
+    }
+
+    #[test]
+    fn distributed_memory_budget_splits_model_size_and_uses_vram() {
+        let manifest = distributed_manifest();
+        let variant = &manifest.variants[0];
+
+        assert_eq!(variant_memory_budget_bytes(variant, 2), 10_200_547_328);
+        assert_eq!(
+            node_available_memory_bytes(&windows_cuda_capabilities()),
+            12 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            node_available_memory_bytes(&sample_capabilities()),
+            12 * 1024 * 1024 * 1024
+        );
     }
 }

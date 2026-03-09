@@ -1,0 +1,22 @@
+[package]
+name = "galactica-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+galactica-common = { workspace = true }
+galactica-observability = { workspace = true }
+galactica-control-plane = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

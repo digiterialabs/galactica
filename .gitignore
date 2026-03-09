@@ -1,0 +1,37 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+*.egg
+
+# Python proto generated stubs
+python/galactica_runtime/proto/*.py
+!python/galactica_runtime/proto/__init__.py
+
+# Node / Dashboard
+node_modules/
+.next/
+out/
+.env*.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Conductor workspace context
+.context/

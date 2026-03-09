@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,6 +16,7 @@ use galactica_common::inference::{
 };
 use galactica_common::proto::{common, control};
 use galactica_common::{GalacticaError, Result};
+use galactica_control_plane::{AuthContext, CredentialKind, inject_auth_metadata};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -24,8 +25,14 @@ pub trait ControlPlaneApi: Send + Sync {
     async fn list_models(
         &self,
         filter_runtime: Option<&str>,
+        auth: &AuthContext,
     ) -> Result<Vec<common::v1::ModelManifest>>;
-    async fn infer(&self, request: InferenceRequest) -> Result<Vec<InferenceChunk>>;
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+        auth: &AuthContext,
+    ) -> Result<Vec<InferenceChunk>>;
+    async fn authenticate(&self, api_key: &str) -> Result<AuthContext>;
 }
 
 #[derive(Clone)]
@@ -46,6 +53,7 @@ impl ControlPlaneApi for GrpcControlPlaneClient {
     async fn list_models(
         &self,
         filter_runtime: Option<&str>,
+        auth: &AuthContext,
     ) -> Result<Vec<common::v1::ModelManifest>> {
         let mut client =
             control::v1::control_plane_client::ControlPlaneClient::connect(self.endpoint.clone())
@@ -55,10 +63,12 @@ impl ControlPlaneApi for GrpcControlPlaneClient {
                         "failed to connect to control plane: {error}"
                     ))
                 })?;
+        let mut request = tonic::Request::new(control::v1::ListAvailableModelsRequest {
+            filter_runtime: filter_runtime.unwrap_or_default().to_string(),
+        });
+        inject_auth_metadata(&mut request, auth)?;
         client
-            .list_available_models(control::v1::ListAvailableModelsRequest {
-                filter_runtime: filter_runtime.unwrap_or_default().to_string(),
-            })
+            .list_available_models(request)
             .await
             .map(|response| response.into_inner().models)
             .map_err(|error| {
@@ -66,7 +76,11 @@ impl ControlPlaneApi for GrpcControlPlaneClient {
             })
     }
 
-    async fn infer(&self, request: InferenceRequest) -> Result<Vec<InferenceChunk>> {
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+        auth: &AuthContext,
+    ) -> Result<Vec<InferenceChunk>> {
         let mut client =
             control::v1::control_plane_client::ControlPlaneClient::connect(self.endpoint.clone())
                 .await
@@ -75,8 +89,10 @@ impl ControlPlaneApi for GrpcControlPlaneClient {
                         "failed to connect to control plane: {error}"
                     ))
                 })?;
+        let mut request = tonic::Request::new(control::v1::InferRequest::from(request));
+        inject_auth_metadata(&mut request, auth)?;
         let response = client
-            .infer(control::v1::InferRequest::from(request))
+            .infer(request)
             .await
             .map_err(|error| GalacticaError::unavailable(format!("infer failed: {error}")))?;
         let mut stream = response.into_inner();
@@ -87,6 +103,50 @@ impl ControlPlaneApi for GrpcControlPlaneClient {
             })?);
         }
         Ok(chunks)
+    }
+
+    async fn authenticate(&self, api_key: &str) -> Result<AuthContext> {
+        let mut client =
+            control::v1::control_plane_client::ControlPlaneClient::connect(self.endpoint.clone())
+                .await
+                .map_err(|error| {
+                    GalacticaError::unavailable(format!(
+                        "failed to connect to control plane: {error}"
+                    ))
+                })?;
+        let response = client
+            .authenticate(control::v1::AuthenticateRequest {
+                credential: Some(control::v1::authenticate_request::Credential::ApiKey(
+                    api_key.to_string(),
+                )),
+            })
+            .await
+            .map_err(|error| {
+                GalacticaError::unauthorized(format!("authentication failed: {error}"))
+            })?
+            .into_inner();
+        if !response.authenticated {
+            return Err(GalacticaError::unauthorized("authentication rejected"));
+        }
+        let tenant_id = response
+            .tenant_id
+            .as_ref()
+            .map(|tenant_id| tenant_id.value.clone())
+            .ok_or_else(|| GalacticaError::unauthorized("control plane did not return a tenant"))?;
+        let expires_at = response
+            .expires_at
+            .map(galactica_common::timestamp_to_chrono)
+            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
+        Ok(AuthContext {
+            tenant_id: tenant_id.clone(),
+            scopes: response.scopes,
+            expires_at,
+            require_mtls: false,
+            allowed_models: Vec::new(),
+            allowed_node_pools: Vec::new(),
+            actor: format!("tenant:{tenant_id}"),
+            credential_kind: CredentialKind::ApiKey,
+        })
     }
 }
 
@@ -107,8 +167,12 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn list_models(State(state): State<GatewayState>) -> Response {
-    match state.client.list_models(None).await {
+async fn list_models(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    let auth = match authenticate_headers(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(error) => return error_response(error),
+    };
+    match state.client.list_models(None, &auth).await {
         Ok(models) => Json(ModelListResponse::from(models)).into_response(),
         Err(error) => error_response(error),
     }
@@ -116,11 +180,16 @@ async fn list_models(State(state): State<GatewayState>) -> Response {
 
 async fn chat_completions(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    let auth = match authenticate_headers(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(error) => return error_response(error),
+    };
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let inference = request.to_inference_request(request_id.clone());
-    match state.client.infer(inference).await {
+    match state.client.infer(inference, &auth).await {
         Ok(chunks) => {
             if request.stream.unwrap_or(false) {
                 streaming_response(request_id, request.model.clone(), chunks).into_response()
@@ -161,6 +230,7 @@ fn streaming_response(
 
 fn error_response(error: GalacticaError) -> Response {
     let status = match error {
+        GalacticaError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
         GalacticaError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
         GalacticaError::NotFound(_) => StatusCode::NOT_FOUND,
         GalacticaError::FailedPrecondition(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -174,6 +244,22 @@ fn error_response(error: GalacticaError) -> Response {
         }
     }));
     (status, body).into_response()
+}
+
+async fn authenticate_headers(state: &GatewayState, headers: &HeaderMap) -> Result<AuthContext> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| GalacticaError::unauthorized("missing API key"))?;
+    state.client.authenticate(&api_key).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,10 +488,12 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
     use galactica_artifact::LocalModelRegistry;
+    use galactica_common::proto::control::v1::control_plane_client::ControlPlaneClient;
     use galactica_common::proto::control::v1::control_plane_server::ControlPlaneServer;
     use galactica_common::proto::node::v1::node_agent_server::NodeAgentServer;
     use galactica_control_plane::{
-        ControlPlaneService, GrpcNodeExecutor, InMemoryStateStore, NodeRegistry,
+        ControlPlaneService, GrpcNodeExecutor, InMemoryStateStore, TenantRecord,
+        inject_node_fingerprint,
     };
     use galactica_node_agent::{
         MlxBackend, NodeAgentService, default_macos_capabilities, default_system_memory,
@@ -420,11 +508,25 @@ mod tests {
     #[derive(Clone)]
     struct MockControlPlaneClient;
 
+    fn sample_tenant_auth() -> AuthContext {
+        AuthContext {
+            tenant_id: "tenant-dev".to_string(),
+            scopes: vec!["inference:read".to_string(), "inference:write".to_string()],
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            require_mtls: false,
+            allowed_models: Vec::new(),
+            allowed_node_pools: Vec::new(),
+            actor: "tenant:tenant-dev".to_string(),
+            credential_kind: CredentialKind::ApiKey,
+        }
+    }
+
     #[async_trait]
     impl ControlPlaneApi for MockControlPlaneClient {
         async fn list_models(
             &self,
             _filter_runtime: Option<&str>,
+            _auth: &AuthContext,
         ) -> Result<Vec<common::v1::ModelManifest>> {
             Ok(vec![common::v1::ModelManifest {
                 model_id: Some(common::v1::ModelId {
@@ -438,7 +540,11 @@ mod tests {
             }])
         }
 
-        async fn infer(&self, request: InferenceRequest) -> Result<Vec<InferenceChunk>> {
+        async fn infer(
+            &self,
+            request: InferenceRequest,
+            _auth: &AuthContext,
+        ) -> Result<Vec<InferenceChunk>> {
             Ok(vec![
                 InferenceChunk {
                     request_id: request.request_id.clone(),
@@ -462,6 +568,10 @@ mod tests {
                 },
             ])
         }
+
+        async fn authenticate(&self, _api_key: &str) -> Result<AuthContext> {
+            Ok(sample_tenant_auth())
+        }
     }
 
     #[tokio::test]
@@ -473,6 +583,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "galactica-dev-key")
                     .body(axum::body::Body::from(
                         r#"{"model":"mistral-small","messages":[{"role":"user","content":"hello"}]}"#,
                     ))
@@ -497,6 +608,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "galactica-dev-key")
                     .body(axum::body::Body::from(
                         r#"{"model":"mistral-small","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
                     ))
@@ -558,32 +670,68 @@ mod tests {
         });
 
         let store = Arc::new(InMemoryStateStore::default());
-        let registry = NodeRegistry::new(store.clone());
-        registry
-            .register(
-                "mac-mini".to_string(),
-                format!("http://{node_addr}"),
-                default_macos_capabilities(),
-                "0.1.0".to_string(),
-            )
-            .await
-            .unwrap();
-
         let control_plane = ControlPlaneService::new(
-            store,
+            store.clone(),
             Arc::new(LocalModelRegistry::new(&root)),
             Arc::new(GrpcNodeExecutor),
         );
+        control_plane
+            .seed_tenant(TenantRecord {
+                tenant_id: "tenant-dev".to_string(),
+                api_key: "galactica-dev-key".to_string(),
+                scopes: vec!["inference:read".to_string(), "inference:write".to_string()],
+                require_mtls: false,
+                max_requests_per_minute: 120,
+                allowed_models: vec!["mistral-small".to_string()],
+                allowed_node_pools: vec!["macos-metal-arm64".to_string()],
+                expires_at: None,
+            })
+            .await
+            .unwrap();
         let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_addr: SocketAddr = control_listener.local_addr().unwrap();
         let control_incoming = TcpListenerStream::new(control_listener);
+        let control_plane_server = control_plane.clone();
         tokio::spawn(async move {
             Server::builder()
-                .add_service(ControlPlaneServer::new(control_plane))
+                .add_service(ControlPlaneServer::new(control_plane_server))
                 .serve_with_incoming(control_incoming)
                 .await
                 .unwrap();
         });
+
+        let mut client = ControlPlaneClient::connect(format!("http://{control_addr}"))
+            .await
+            .unwrap();
+        let enrollment_token = control_plane
+            .mint_enrollment_token(
+                "tenant-dev",
+                vec!["node".to_string()],
+                std::time::Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+        let enrolled = client
+            .enroll_node(control::v1::EnrollNodeRequest {
+                enrollment_token,
+                hostname: "mac-mini".to_string(),
+                capabilities: Some(default_macos_capabilities()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut register = tonic::Request::new(control::v1::RegisterNodeRequest {
+            hostname: "mac-mini".to_string(),
+            capabilities: Some(default_macos_capabilities()),
+            version: "0.1.0".to_string(),
+            agent_endpoint: format!("http://{node_addr}"),
+        });
+        inject_node_fingerprint(
+            &mut register,
+            &galactica_control_plane::sha256_hex(&enrolled.identity.unwrap().certificate_pem),
+        )
+        .unwrap();
+        client.register_node(register).await.unwrap();
 
         let app = build_router(Arc::new(GrpcControlPlaneClient::new(format!(
             "http://{control_addr}"
@@ -594,6 +742,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/v1/models")
+                    .header("x-api-key", "galactica-dev-key")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -607,6 +756,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "galactica-dev-key")
                     .body(axum::body::Body::from(
                         r#"{"model":"mistral-small","messages":[{"role":"user","content":"summarize node health"}]}"#,
                     ))

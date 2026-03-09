@@ -196,8 +196,7 @@ impl RuntimeBackend for MlxBackend {
         let instance_id = format!("mlx-{}", uuid::Uuid::new_v4());
         let memory_used_bytes = request
             .max_memory_bytes
-            .min(6 * 1024 * 1024 * 1024)
-            .max(512 * 1024 * 1024);
+            .clamp(512 * 1024 * 1024, 6 * 1024 * 1024 * 1024);
 
         self.loaded_models.write().await.insert(
             instance_id.clone(),
@@ -585,7 +584,7 @@ where
         Ok(Response::new(node::v1::GetStatusResponse {
             status: common::v1::NodeStatus::Online as i32,
             capabilities: Some(self.capabilities.clone()),
-            system_memory: Some(self.system_memory.clone()),
+            system_memory: Some(self.system_memory),
             loaded_models,
         }))
     }

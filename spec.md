@@ -87,7 +87,7 @@ Distributed low-latency inference is allowed within compatible pools. Cross-pool
 
 Recommended implementation:
 - `Rust` service
-- `Postgres` for durable state
+- `SQLite` for durable state with a single active control plane
 - `Redis` or `NATS` optional for ephemeral coordination/events
 
 **8. Node Agent Responsibilities**

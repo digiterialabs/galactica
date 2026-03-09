@@ -100,6 +100,20 @@ fmt-all: fmt py-fmt
 # Check all formatting
 fmt-check-all: fmt-check py-fmt-check
 
+# === Git Hooks (Husky) ===
+
+# Install Husky and register local Git hooks
+precommit-install:
+    npm install
+
+# Run the Husky pre-commit checks manually
+precommit-run:
+    npm run hooks:pre-commit
+
+# Run the Husky pre-push checks manually
+prepush-run:
+    npm run hooks:pre-push
+
 # Clean all build artifacts
 clean:
     cargo clean

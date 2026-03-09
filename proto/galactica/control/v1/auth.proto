@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package galactica.control.v1;
+
+import "google/protobuf/timestamp.proto";
+import "galactica/common/v1/common.proto";
+
+message EnrollmentToken {
+  string token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  galactica.common.v1.TenantId tenant_id = 3;
+  repeated string allowed_roles = 4;
+}
+
+message NodeIdentity {
+  galactica.common.v1.NodeId node_id = 1;
+  string certificate_pem = 2;
+  string private_key_pem = 3;
+  google.protobuf.Timestamp issued_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message TenantCredentials {
+  galactica.common.v1.TenantId tenant_id = 1;
+  string api_key = 2;
+  repeated string scopes = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message AuthPolicy {
+  galactica.common.v1.TenantId tenant_id = 1;
+  bool require_mtls = 2;
+  uint32 max_requests_per_minute = 3;
+  repeated string allowed_models = 4;
+  repeated string allowed_node_pools = 5;
+}

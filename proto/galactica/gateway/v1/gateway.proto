@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package galactica.gateway.v1;
+
+import "galactica/common/v1/common.proto";
+
+service InferenceGateway {
+  rpc Infer(InferRequest) returns (InferResponse);
+  rpc InferStream(InferRequest) returns (stream InferStreamChunk);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+}
+
+message InferRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  InferenceParams params = 3;
+  string request_id = 4;
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message InferenceParams {
+  float temperature = 1;
+  float top_p = 2;
+  uint32 max_tokens = 3;
+  repeated string stop = 4;
+  float frequency_penalty = 5;
+  float presence_penalty = 6;
+}
+
+message InferResponse {
+  string request_id = 1;
+  string model = 2;
+  repeated Choice choices = 3;
+  Usage usage = 4;
+}
+
+message Choice {
+  uint32 index = 1;
+  ChatMessage message = 2;
+  string finish_reason = 3;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+message InferStreamChunk {
+  string request_id = 1;
+  string model = 2;
+  uint32 choice_index = 3;
+  string delta_content = 4;
+  string finish_reason = 5;
+  Usage usage = 6;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+message ModelInfo {
+  string id = 1;
+  string name = 2;
+  string family = 3;
+  repeated string available_runtimes = 4;
+  bool ready = 5;
+}

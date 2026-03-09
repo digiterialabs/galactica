@@ -1,3 +1,5 @@
+pub mod download;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -12,6 +14,10 @@ use tokio::sync::{RwLock, broadcast};
 use tonic::{Request, Response, Status};
 
 pub use artifact::v1::artifact_service_server::{ArtifactService, ArtifactServiceServer};
+pub use download::{
+    ArtifactDownloadSource, ArtifactFetcher, CacheEntry, CacheKey, DownloadManager,
+    DownloadRequest, LocalCache, sha256_digest, verify_content_hash,
+};
 
 type DownloadStream = Pin<
     Box<
@@ -446,15 +452,22 @@ pub struct DownloadTracker {
 
 impl DownloadTracker {
     pub async fn record(&self, progress: artifact::v1::DownloadProgress) {
-        let key = download_key(
-            progress
-                .model_id
-                .as_ref()
-                .map(|model_id| model_id.value.as_str())
-                .unwrap_or_default(),
-            None,
-            None,
-        );
+        let model_id = progress
+            .model_id
+            .as_ref()
+            .map(|model_id| model_id.value.clone())
+            .unwrap_or_default();
+        self.record_scoped(&model_id, None, None, progress).await;
+    }
+
+    pub async fn record_scoped(
+        &self,
+        model_id: &str,
+        runtime: Option<&str>,
+        quantization: Option<&str>,
+        progress: artifact::v1::DownloadProgress,
+    ) {
+        let key = download_key(model_id, runtime, quantization);
         let sender = self.sender(key).await;
         let _ = sender.send(progress);
     }

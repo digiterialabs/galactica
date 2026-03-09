@@ -2,6 +2,33 @@
 
 `galactica-cli` release assets are published by `.github/workflows/release.yml`.
 
+## One-line install
+
+From a Galactica checkout on Apple Silicon macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/digiterialabs/galactica/main/scripts/install.sh | sh
+```
+
+From a Galactica checkout on Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/digiterialabs/galactica/main/scripts/install.ps1 | iex
+```
+
+These bootstrap scripts:
+
+- auto-detect the current host OS and CPU architecture
+- resolve the matching `galactica-cli` asset from the latest GitHub Release
+- install `galactica-cli` into a user-local `bin` directory
+- create a `galactica` launcher bound to the current repo checkout
+
+Current release coverage:
+
+- Apple Silicon macOS
+- Windows x64
+- Linux x64
+
 ## Publish a release
 
 Create and push a semver tag:
@@ -24,7 +51,7 @@ It packages them into release assets named like:
 
 The publish job also uploads `SHA256SUMS.txt`.
 
-## Installer behavior
+## CLI installer behavior
 
 `cargo run -p galactica-cli -- self-install` now tries to install from the latest GitHub Release first.
 

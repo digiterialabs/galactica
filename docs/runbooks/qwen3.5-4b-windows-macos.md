@@ -22,6 +22,18 @@ This repo can run `qwen3.5-4b` in two useful modes:
 
 Use `galactica-cli`. It auto-detects the current host, picks the matching node config, and recommends the model runtime for `qwen3.5-4b`.
 
+Install the CLI from the repo checkout in one line on Apple Silicon macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/digiterialabs/galactica/main/scripts/install.sh | sh
+```
+
+Install the CLI from the repo checkout in one line on Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/digiterialabs/galactica/main/scripts/install.ps1 | iex
+```
+
 Detect the current host:
 
 ```bash

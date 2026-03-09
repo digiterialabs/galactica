@@ -49,7 +49,30 @@ pub struct ModelInstanceRecord {
     pub runtime: String,
     pub quantization: String,
     pub memory_used_bytes: u64,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub shard_index: Option<u32>,
+    #[serde(default)]
+    pub shard_count: Option<u32>,
+    #[serde(default)]
+    pub is_coordinator: bool,
+    #[serde(default)]
+    pub backend_family: Option<String>,
     pub status: InstanceStatus,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DistributedGroupRecord {
+    pub group_id: String,
+    pub model_id: String,
+    pub runtime: String,
+    pub quantization: String,
+    pub backend_family: String,
+    pub coordinator_node_id: String,
+    pub shard_count: u32,
+    pub node_ids: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -80,6 +103,7 @@ pub struct DownloadRecord {
 pub struct ClusterState {
     pub nodes: BTreeMap<String, NodeRecord>,
     pub instances: BTreeMap<String, ModelInstanceRecord>,
+    pub groups: BTreeMap<String, DistributedGroupRecord>,
     pub tasks: BTreeMap<String, TaskRecord>,
     pub downloads: BTreeMap<String, DownloadRecord>,
     pub last_sequence: u64,
@@ -119,6 +143,12 @@ pub enum ControlEvent {
     },
     InstanceCreated {
         instance: ModelInstanceRecord,
+    },
+    GroupCreated {
+        group: DistributedGroupRecord,
+    },
+    GroupDeleted {
+        group_id: String,
     },
     InstanceDeleted {
         instance_id: String,
@@ -252,6 +282,12 @@ pub fn event_apply(state: &ClusterState, event: &EventEnvelope) -> ClusterState 
         ControlEvent::InstanceCreated { instance } => {
             next.instances
                 .insert(instance.instance_id.clone(), instance.clone());
+        }
+        ControlEvent::GroupCreated { group } => {
+            next.groups.insert(group.group_id.clone(), group.clone());
+        }
+        ControlEvent::GroupDeleted { group_id } => {
+            next.groups.remove(group_id);
         }
         ControlEvent::InstanceDeleted { instance_id } => {
             next.instances.remove(instance_id);

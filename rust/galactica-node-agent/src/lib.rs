@@ -256,10 +256,27 @@ where
                     model_id: request.model_id,
                     quantization: request.variant_quantization,
                     max_memory_bytes: request.max_memory_bytes,
-                    runtime_options: HashMap::from([(
-                        "variant_runtime".to_string(),
-                        request.variant_runtime,
-                    )]),
+                    runtime_options: {
+                        let mut runtime_options = request
+                            .distributed
+                            .as_ref()
+                            .map(|distributed| distributed.runtime_options.clone())
+                            .unwrap_or_default();
+                        runtime_options
+                            .insert("variant_runtime".to_string(), request.variant_runtime);
+                        runtime_options
+                    },
+                    distributed: request.distributed.map(|distributed| {
+                        runtime::v1::DistributedRuntimeSpec {
+                            group_id: distributed.group_id,
+                            backend_family: distributed.backend_family,
+                            shard_index: distributed.shard_index,
+                            shard_count: distributed.shard_count,
+                            is_coordinator: distributed.is_coordinator,
+                            shard_assignments: distributed.shard_assignments,
+                            runtime_options: distributed.runtime_options,
+                        }
+                    }),
                 })
                 .await?;
 
@@ -267,6 +284,9 @@ where
                 instance_id: response.instance_id,
                 success: response.success,
                 error_message: response.error_message,
+                group_id: response.group_id,
+                shard_index: response.shard_index,
+                is_coordinator: response.is_coordinator,
             }))
         }
         .instrument(span)
@@ -312,6 +332,10 @@ where
                     model_id: model.model_id,
                     runtime: runtime_name.clone(),
                     memory_used_bytes: model.memory_used_bytes,
+                    group_id: model.group_id,
+                    shard_index: model.shard_index,
+                    is_coordinator: model.is_coordinator,
+                    backend_family: model.backend_family,
                 })
                 .collect();
 
@@ -381,6 +405,7 @@ mod tests {
                 quantization: "4bit".to_string(),
                 max_memory_bytes: 2 * 1024 * 1024 * 1024,
                 runtime_options: HashMap::new(),
+                distributed: None,
             })
             .await
             .unwrap();
@@ -432,6 +457,7 @@ mod tests {
                 variant_runtime: "mlx".to_string(),
                 variant_quantization: "4bit".to_string(),
                 max_memory_bytes: 2 * 1024 * 1024 * 1024,
+                distributed: None,
             }))
             .await
             .unwrap()
@@ -464,5 +490,56 @@ mod tests {
                 .unwrap()
                 .contains("summarize")
         );
+    }
+
+    #[tokio::test]
+    async fn node_agent_reports_distributed_model_metadata() {
+        let backend = Arc::new(MlxBackend::new());
+        let agent = NodeAgentService::new(
+            backend,
+            default_macos_capabilities(),
+            default_system_memory(),
+        );
+        let loaded = agent
+            .load_model(Request::new(super::node::v1::LoadModelRequest {
+                model_id: Some(super::common::v1::ModelId {
+                    value: "qwen3.5-27b".to_string(),
+                }),
+                variant_runtime: "mlx".to_string(),
+                variant_quantization: "4bit".to_string(),
+                max_memory_bytes: 6 * 1024 * 1024 * 1024,
+                distributed: Some(super::node::v1::DistributedGroupSpec {
+                    group_id: "group-test".to_string(),
+                    backend_family: "mlx".to_string(),
+                    shard_index: 1,
+                    shard_count: 2,
+                    is_coordinator: false,
+                    shard_assignments: vec![],
+                    runtime_options: HashMap::from([(
+                        "tensor_parallel_size".to_string(),
+                        "2".to_string(),
+                    )]),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(loaded.group_id, "group-test");
+        assert_eq!(loaded.shard_index, 1);
+        assert!(!loaded.is_coordinator);
+
+        let status = agent
+            .get_status(Request::new(super::node::v1::GetStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(status.loaded_models.len(), 1);
+        let model = &status.loaded_models[0];
+        assert_eq!(model.group_id, "group-test");
+        assert_eq!(model.shard_index, 1);
+        assert!(!model.is_coordinator);
+        assert_eq!(model.backend_family, "mlx");
     }
 }

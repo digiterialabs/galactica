@@ -1382,6 +1382,10 @@ mod tests {
                         value: "node-a".to_string(),
                     }),
                     runtime: "mlx".to_string(),
+                    group_id: String::new(),
+                    shard_index: 0,
+                    is_coordinator: false,
+                    backend_family: String::new(),
                 }],
             })
         }

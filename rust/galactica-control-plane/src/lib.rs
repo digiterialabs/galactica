@@ -18,7 +18,7 @@ use galactica_common::inference::{
 };
 use galactica_common::proto::{common, control, node};
 use galactica_common::{GalacticaError, Result, chrono_to_timestamp, timestamp_to_chrono};
-use galactica_networking::issue_tls_identity;
+use galactica_networking::{endpoint_from_url, issue_tls_identity, preferred_endpoint};
 use galactica_observability::{
     inject_trace_context_into_tonic_request, set_parent_from_tonic_request,
 };
@@ -477,6 +477,7 @@ impl NodeRegistry {
         &self,
         hostname: String,
         agent_endpoint: String,
+        agent_endpoints: Vec<common::v1::NetworkEndpoint>,
         capabilities: common::v1::NodeCapabilities,
         version: String,
     ) -> Result<NodeRecord> {
@@ -484,6 +485,7 @@ impl NodeRegistry {
             format!("node-{}", uuid::Uuid::new_v4()),
             hostname,
             agent_endpoint,
+            agent_endpoints,
             capabilities,
             version,
         )
@@ -495,14 +497,18 @@ impl NodeRegistry {
         node_id: String,
         hostname: String,
         agent_endpoint: String,
+        agent_endpoints: Vec<common::v1::NetworkEndpoint>,
         capabilities: common::v1::NodeCapabilities,
         version: String,
     ) -> Result<NodeRecord> {
         let now = Utc::now();
+        let agent_endpoints =
+            normalize_registered_agent_endpoints(&agent_endpoint, agent_endpoints);
         let node = NodeRecord {
             node_id,
             hostname,
-            agent_endpoint,
+            agent_endpoint: preferred_endpoint(&agent_endpoints).unwrap_or(agent_endpoint),
+            agent_endpoints,
             capabilities: capabilities.clone(),
             status: common::v1::NodeStatus::Online as i32,
             last_heartbeat: now,
@@ -570,6 +576,32 @@ impl NodeRegistry {
             .await?;
         Ok(())
     }
+}
+
+fn normalize_registered_agent_endpoints(
+    agent_endpoint: &str,
+    agent_endpoints: Vec<common::v1::NetworkEndpoint>,
+) -> Vec<common::v1::NetworkEndpoint> {
+    let mut endpoints = BTreeMap::new();
+    for endpoint in agent_endpoints {
+        if endpoint.url.is_empty() {
+            continue;
+        }
+        endpoints.entry(endpoint.url.clone()).or_insert(endpoint);
+    }
+
+    if !agent_endpoint.is_empty() && !endpoints.contains_key(agent_endpoint) {
+        endpoints.insert(
+            agent_endpoint.to_string(),
+            endpoint_from_url(
+                agent_endpoint.to_string(),
+                common::v1::EndpointKind::Unspecified,
+                200,
+            ),
+        );
+    }
+
+    endpoints.into_values().collect()
 }
 
 #[async_trait]
@@ -1329,6 +1361,7 @@ where
                     identity.node_id.clone(),
                     request.hostname,
                     request.agent_endpoint,
+                    request.agent_endpoints,
                     capabilities,
                     request.version,
                 )
@@ -1916,6 +1949,24 @@ mod tests {
 
     use super::*;
 
+    fn single_endpoint(
+        url: &str,
+        kind: common::v1::EndpointKind,
+    ) -> Vec<common::v1::NetworkEndpoint> {
+        vec![common::v1::NetworkEndpoint {
+            url: url.to_string(),
+            kind: kind as i32,
+            priority: match kind {
+                common::v1::EndpointKind::Tailscale => 10,
+                common::v1::EndpointKind::Lan => 20,
+                common::v1::EndpointKind::Wan => 30,
+                common::v1::EndpointKind::Loopback => 100,
+                common::v1::EndpointKind::Unspecified => 200,
+            },
+            metadata: HashMap::new(),
+        }]
+    }
+
     fn sample_tenant() -> TenantRecord {
         TenantRecord {
             tenant_id: "tenant-dev".to_string(),
@@ -1937,6 +1988,10 @@ mod tests {
             node_id: node_id.to_string(),
             hostname: format!("{node_id}.local"),
             agent_endpoint: "http://127.0.0.1:50061".to_string(),
+            agent_endpoints: single_endpoint(
+                "http://127.0.0.1:50061",
+                common::v1::EndpointKind::Lan,
+            ),
             capabilities: default_macos_capabilities(),
             status: common::v1::NodeStatus::Online as i32,
             last_heartbeat: Utc::now(),
@@ -1951,6 +2006,10 @@ mod tests {
             node_id: node_id.to_string(),
             hostname: format!("{node_id}.local"),
             agent_endpoint: "http://127.0.0.1:50062".to_string(),
+            agent_endpoints: single_endpoint(
+                "http://127.0.0.1:50062",
+                common::v1::EndpointKind::Tailscale,
+            ),
             capabilities: common::v1::NodeCapabilities {
                 os: common::v1::OsType::Windows as i32,
                 cpu_arch: common::v1::CpuArch::X8664 as i32,
@@ -2001,6 +2060,10 @@ mod tests {
             node_id: node_id.to_string(),
             hostname: format!("{node_id}.local"),
             agent_endpoint: "http://127.0.0.1:50063".to_string(),
+            agent_endpoints: single_endpoint(
+                "http://127.0.0.1:50063",
+                common::v1::EndpointKind::Lan,
+            ),
             capabilities: common::v1::NodeCapabilities {
                 os: common::v1::OsType::Macos as i32,
                 cpu_arch: common::v1::CpuArch::X8664 as i32,
@@ -2169,6 +2232,10 @@ mod tests {
                 node_id: "node-b".to_string(),
                 hostname: "node-b".to_string(),
                 agent_endpoint: "http://127.0.0.1:50062".to_string(),
+                agent_endpoints: single_endpoint(
+                    "http://127.0.0.1:50062",
+                    common::v1::EndpointKind::Lan,
+                ),
                 capabilities: common::v1::NodeCapabilities {
                     os: common::v1::OsType::Linux as i32,
                     cpu_arch: common::v1::CpuArch::X8664 as i32,
@@ -2580,6 +2647,7 @@ mod tests {
             .register(
                 "mac-mini".to_string(),
                 "http://127.0.0.1:50061".to_string(),
+                single_endpoint("http://127.0.0.1:50061", common::v1::EndpointKind::Loopback),
                 default_macos_capabilities(),
                 "0.1.0".to_string(),
             )
@@ -2676,6 +2744,10 @@ mod tests {
             capabilities: Some(default_macos_capabilities()),
             version: "0.1.0".to_string(),
             agent_endpoint: format!("http://{addr}"),
+            agent_endpoints: single_endpoint(
+                &format!("http://{addr}"),
+                common::v1::EndpointKind::Loopback,
+            ),
         });
         inject_node_fingerprint(&mut register, &fingerprint).unwrap();
         service.register_node(register).await.unwrap();

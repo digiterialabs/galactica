@@ -71,6 +71,7 @@ prometheus-client = "0.22"
 
 # Networking
 libp2p = { version = "0.55", features = ["tokio", "mdns", "noise", "yamux", "tcp", "gossipsub", "identify"] }
+if-addrs = "0.15"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -26,6 +26,7 @@ message RegisterNodeRequest {
   galactica.common.v1.NodeCapabilities capabilities = 2;
   string version = 3;
   string agent_endpoint = 4;
+  repeated galactica.common.v1.NetworkEndpoint agent_endpoints = 5;
 }
 
 message RegisterNodeResponse {

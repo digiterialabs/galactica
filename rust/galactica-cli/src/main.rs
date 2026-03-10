@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +14,9 @@ use galactica_artifact::{
 use galactica_common::proto::common::v1::{
     AcceleratorType, CpuArch, ModelManifest, NodeCapabilities, OsType,
 };
+use galactica_networking::{detect_bind_endpoints, preferred_endpoint};
 use galactica_node_agent::DefaultHardwareDetector;
+use reqwest::Url;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -158,7 +159,9 @@ struct DetectionReport {
     recommended_quantization: Option<String>,
     recommended_node_config: String,
     detected_local_ip: String,
+    detected_local_ips: Vec<String>,
     suggested_agent_endpoint: String,
+    suggested_agent_endpoints: Vec<String>,
     notes: Vec<String>,
 }
 
@@ -294,6 +297,12 @@ async fn cmd_detect(repo_root: &Path, args: ModelArgs) -> Result<()> {
         "Suggested agent endpoint: {}",
         report.suggested_agent_endpoint
     );
+    if report.suggested_agent_endpoints.len() > 1 {
+        println!("Detected agent endpoints:");
+        for endpoint in &report.suggested_agent_endpoints {
+            println!("- {endpoint}");
+        }
+    }
     if !report.notes.is_empty() {
         println!("Notes:");
         for note in &report.notes {
@@ -596,10 +605,10 @@ async fn cmd_up(repo_root: &Path, args: UpArgs) -> Result<()> {
             let token = resolve_enrollment_token(repo_root, token)?;
             let control_plane_addr = control_plane_addr
                 .or_else(|| env::var("GALACTICA_CONTROL_PLANE_ADDR").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
+                .filter(|value| !value.is_empty());
             let agent_endpoint = agent_endpoint
                 .or_else(|| env::var("GALACTICA_AGENT_ENDPOINT").ok())
-                .unwrap_or_else(|| detection.suggested_agent_endpoint.clone());
+                .filter(|value| !value.is_empty());
             let mut args = vec![
                 "--config".to_string(),
                 repo_root
@@ -608,11 +617,15 @@ async fn cmd_up(repo_root: &Path, args: UpArgs) -> Result<()> {
                     .to_string(),
                 "--enrollment-token".to_string(),
                 token,
-                "--control-plane-addr".to_string(),
-                control_plane_addr,
-                "--agent-endpoint".to_string(),
-                agent_endpoint,
             ];
+            if let Some(control_plane_addr) = control_plane_addr {
+                args.push("--control-plane-addr".to_string());
+                args.push(control_plane_addr);
+            }
+            if let Some(agent_endpoint) = agent_endpoint {
+                args.push("--agent-endpoint".to_string());
+                args.push(agent_endpoint);
+            }
             if let Some(runtime) = &detection.recommended_runtime {
                 args.push("--runtime-backend".to_string());
                 args.push(runtime.clone());
@@ -645,7 +658,15 @@ async fn detect_host(repo_root: &Path, model: &str) -> Result<DetectionReport> {
         .map(|variant| variant.runtime.clone())
         .or_else(|| fallback_runtime(&capabilities));
     let recommended_quantization = variant.as_ref().map(|variant| variant.quantization.clone());
-    let detected_local_ip = detect_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    let agent_endpoints = detect_bind_endpoints(50061);
+    let suggested_agent_endpoint = preferred_endpoint(&agent_endpoints)
+        .unwrap_or_else(|| "http://127.0.0.1:50061".to_string());
+    let suggested_agent_endpoints = agent_endpoints
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .collect::<Vec<_>>();
+    let detected_local_ips = ordered_endpoint_hosts(&suggested_agent_endpoints);
+    let detected_local_ip = preferred_detected_ip(&suggested_agent_endpoint, &detected_local_ips);
     let node_config = default_node_config_for_capabilities(&capabilities);
     let notes = build_notes(model, manifest.as_ref(), &capabilities, variant.as_ref());
 
@@ -661,8 +682,10 @@ async fn detect_host(repo_root: &Path, model: &str) -> Result<DetectionReport> {
         recommended_runtime,
         recommended_quantization,
         recommended_node_config: node_config.display().to_string(),
-        suggested_agent_endpoint: format!("http://{}:50061", detected_local_ip),
         detected_local_ip,
+        detected_local_ips,
+        suggested_agent_endpoint,
+        suggested_agent_endpoints,
         notes,
     })
 }
@@ -1802,10 +1825,7 @@ fn next_steps(detection: &DetectionReport) -> Vec<String> {
         }
         "windows" => {
             steps.push("galactica-cli doctor".to_string());
-            steps.push(
-                "galactica-cli up node --token <TOKEN> --control-plane-addr http://<MAC_IP>:9090"
-                    .to_string(),
-            );
+            steps.push("galactica-cli up node --token <TOKEN>".to_string());
         }
         _ => {
             steps.push("galactica-cli doctor".to_string());
@@ -1955,15 +1975,33 @@ fn executable_names(command: &str) -> Vec<String> {
     }
 }
 
-fn detect_local_ip() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    match ip {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
-        IpAddr::V6(ip) if !ip.is_loopback() => Some(ip.to_string()),
-        _ => None,
+fn ordered_endpoint_hosts(endpoints: &[String]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for endpoint in endpoints {
+        let Some(host) = endpoint_host(endpoint) else {
+            continue;
+        };
+        if !hosts.iter().any(|existing| existing == &host) {
+            hosts.push(host);
+        }
     }
+    hosts
+}
+
+fn preferred_detected_ip(suggested_agent_endpoint: &str, detected_local_ips: &[String]) -> String {
+    detected_local_ips
+        .iter()
+        .find(|ip| ip.as_str() != "127.0.0.1" && ip.as_str() != "::1")
+        .cloned()
+        .or_else(|| endpoint_host(suggested_agent_endpoint))
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    Url::parse(endpoint)
+        .ok()?
+        .host_str()
+        .map(|host| host.to_string())
 }
 
 fn default_node_config_for_capabilities(capabilities: &NodeCapabilities) -> PathBuf {
@@ -2196,7 +2234,9 @@ mod tests {
             recommended_quantization: Some("q4_k_m".to_string()),
             recommended_node_config: "config/dev/linux-node-agent.toml".to_string(),
             detected_local_ip: "127.0.0.1".to_string(),
+            detected_local_ips: vec!["127.0.0.1".to_string()],
             suggested_agent_endpoint: "http://127.0.0.1:50061".to_string(),
+            suggested_agent_endpoints: vec!["http://127.0.0.1:50061".to_string()],
             notes: Vec::new(),
         }
     }

@@ -16,6 +16,8 @@ pub struct NodeRecord {
     pub node_id: String,
     pub hostname: String,
     pub agent_endpoint: String,
+    #[serde(with = "network_endpoints_serde", default)]
+    pub agent_endpoints: Vec<common::v1::NetworkEndpoint>,
     #[serde(with = "node_capabilities_serde")]
     pub capabilities: common::v1::NodeCapabilities,
     pub status: i32,
@@ -37,6 +39,7 @@ impl NodeRecord {
             status: self.status,
             last_heartbeat: Some(chrono_to_timestamp(self.last_heartbeat)),
             version: self.version.clone(),
+            agent_endpoints: self.agent_endpoints.clone(),
         }
     }
 }
@@ -1015,6 +1018,14 @@ struct StoredAcceleratorInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredNetworkEndpoint {
+    url: String,
+    kind: i32,
+    priority: u32,
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredNodeCapabilities {
     os: i32,
     cpu_arch: i32,
@@ -1081,6 +1092,34 @@ fn capabilities_from_stored(value: StoredNodeCapabilities) -> common::v1::NodeCa
     }
 }
 
+fn network_endpoints_to_stored(
+    value: &[common::v1::NetworkEndpoint],
+) -> Vec<StoredNetworkEndpoint> {
+    value
+        .iter()
+        .map(|endpoint| StoredNetworkEndpoint {
+            url: endpoint.url.clone(),
+            kind: endpoint.kind,
+            priority: endpoint.priority,
+            metadata: endpoint.metadata.clone(),
+        })
+        .collect()
+}
+
+fn network_endpoints_from_stored(
+    value: Vec<StoredNetworkEndpoint>,
+) -> Vec<common::v1::NetworkEndpoint> {
+    value
+        .into_iter()
+        .map(|endpoint| common::v1::NetworkEndpoint {
+            url: endpoint.url,
+            kind: endpoint.kind,
+            priority: endpoint.priority,
+            metadata: endpoint.metadata,
+        })
+        .collect()
+}
+
 mod option_memory_serde {
     use super::*;
 
@@ -1127,6 +1166,29 @@ mod node_capabilities_serde {
     }
 }
 
+mod network_endpoints_serde {
+    use super::*;
+
+    pub fn serialize<S>(
+        value: &[common::v1::NetworkEndpoint],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        network_endpoints_to_stored(value).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<common::v1::NetworkEndpoint>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<StoredNetworkEndpoint>::deserialize(deserializer).map(network_endpoints_from_stored)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1161,6 +1223,12 @@ mod tests {
             node_id: node_id.to_string(),
             hostname: format!("{node_id}.local"),
             agent_endpoint: "http://127.0.0.1:50061".to_string(),
+            agent_endpoints: vec![common::v1::NetworkEndpoint {
+                url: "http://127.0.0.1:50061".to_string(),
+                kind: common::v1::EndpointKind::Lan as i32,
+                priority: 20,
+                metadata: HashMap::new(),
+            }],
             capabilities: sample_capabilities(),
             status: common::v1::NodeStatus::Online as i32,
             last_heartbeat: Utc::now(),

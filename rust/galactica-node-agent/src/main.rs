@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -6,17 +7,23 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use galactica_artifact::runtime_preference_score;
 use galactica_common::proto::{common, control};
-use galactica_networking::fingerprint_certificate;
+use galactica_networking::{
+    detect_bind_endpoints, detect_lan_scan_control_plane_endpoints,
+    detect_tailscale_peer_control_plane_endpoints, discover_mdns_control_plane_endpoints,
+    endpoint_from_url, fingerprint_certificate, preferred_endpoint,
+};
 use galactica_node_agent::{
     DefaultHardwareDetector, LlamaCppBackend, LlamaCppBackendConfig, MlxBackend, MlxBackendConfig,
     NodeAgentServer, NodeAgentService, OnnxBackend, RuntimeBackend, VllmBackend,
 };
 use galactica_observability::{init_tracing, inject_trace_context_into_tonic_request};
+use reqwest::Url;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
@@ -99,6 +106,17 @@ struct EnrolledIdentity {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone)]
+struct RegistrationConfig {
+    control_plane_addr: String,
+    hostname: String,
+    agent_endpoint: String,
+    agent_endpoints: Vec<common::v1::NetworkEndpoint>,
+    version: String,
+    capabilities: common::v1::NodeCapabilities,
+    system_memory: common::v1::Memory,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -127,48 +145,81 @@ async fn main() -> Result<()> {
     let local_addr = listener
         .local_addr()
         .context("failed to resolve node agent listener address")?;
-    let agent_endpoint = config
-        .agent_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("http://{local_addr}"));
+    let agent_endpoints = merge_agent_endpoints(local_addr, config.agent_endpoint.clone());
+    let agent_endpoint =
+        preferred_endpoint(&agent_endpoints).unwrap_or_else(|| format!("http://{local_addr}"));
 
     if let Some(enrollment_token) = config.enrollment_token.clone() {
-        let control_plane_addr = config.control_plane_addr.clone();
+        let configured_control_plane_addr = config.control_plane_addr.clone();
         let registration_hostname = hostname.clone();
         let registration_capabilities = capabilities.clone();
         let registration_memory = system_memory;
         let version = config.version.clone();
         let advertised_endpoint = agent_endpoint.clone();
+        let advertised_endpoints = agent_endpoints.clone();
         tokio::spawn(async move {
-            let enrolled = loop {
-                match enroll_node(
-                    &control_plane_addr,
-                    &enrollment_token,
-                    &registration_hostname,
-                    registration_capabilities.clone(),
-                )
-                .await
-                {
-                    Ok(identity) => break identity,
-                    Err(error) => {
-                        warn!(error = %error, "node enrollment failed; retrying in 5s");
-                        sleep(Duration::from_secs(5)).await;
+            let mut enrolled: Option<EnrolledIdentity> = None;
+
+            loop {
+                let control_plane_addr =
+                    match resolve_control_plane_addr(&configured_control_plane_addr).await {
+                        Some(addr) => addr,
+                        None => {
+                            warn!(
+                                configured_control_plane_addr = %configured_control_plane_addr,
+                                "failed to discover a reachable control plane; retrying in 5s"
+                            );
+                            sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    };
+
+                if enrolled.is_none() {
+                    match enroll_node(
+                        &control_plane_addr,
+                        &enrollment_token,
+                        &registration_hostname,
+                        registration_capabilities.clone(),
+                    )
+                    .await
+                    {
+                        Ok(identity) => {
+                            enrolled = Some(identity);
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                control_plane_addr = %control_plane_addr,
+                                "node enrollment failed; retrying in 5s"
+                            );
+                            sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
                     }
                 }
-            };
 
-            if let Err(error) = maintain_registration(
-                &control_plane_addr,
-                &registration_hostname,
-                &advertised_endpoint,
-                &version,
-                registration_capabilities,
-                registration_memory,
-                enrolled,
-            )
-            .await
-            {
-                warn!(error = %error, "node registration loop exited");
+                if let Some(identity) = enrolled.clone()
+                    && let Err(error) = maintain_registration(
+                        RegistrationConfig {
+                            control_plane_addr: control_plane_addr.clone(),
+                            hostname: registration_hostname.clone(),
+                            agent_endpoint: advertised_endpoint.clone(),
+                            agent_endpoints: advertised_endpoints.clone(),
+                            version: version.clone(),
+                            capabilities: registration_capabilities.clone(),
+                            system_memory: registration_memory,
+                        },
+                        identity,
+                    )
+                    .await
+                {
+                    warn!(
+                        error = %error,
+                        control_plane_addr = %control_plane_addr,
+                        "node registration loop exited; re-discovering control plane in 5s"
+                    );
+                    sleep(Duration::from_secs(5)).await;
+                }
             }
         });
     } else {
@@ -180,6 +231,7 @@ async fn main() -> Result<()> {
         control_plane_addr = %config.control_plane_addr,
         hostname = %hostname,
         agent_endpoint = %agent_endpoint,
+        agent_endpoint_count = agent_endpoints.len(),
         runtime_backend = %backend_name,
         models_root = %config.models_root.display(),
         default_heartbeat_interval_seconds = config.heartbeat_interval_seconds,
@@ -225,6 +277,149 @@ impl EffectiveConfig {
                 .unwrap_or(15),
         }
     }
+}
+
+fn merge_agent_endpoints(
+    local_addr: SocketAddr,
+    configured_agent_endpoint: Option<String>,
+) -> Vec<common::v1::NetworkEndpoint> {
+    let mut endpoints = BTreeMap::new();
+
+    for endpoint in detect_bind_endpoints(local_addr.port()) {
+        endpoints.insert(endpoint.url.clone(), endpoint);
+    }
+
+    if let Some(agent_endpoint) = configured_agent_endpoint.filter(|value| !value.is_empty()) {
+        endpoints.insert(
+            agent_endpoint.clone(),
+            endpoint_from_url(agent_endpoint, common::v1::EndpointKind::Unspecified, 0),
+        );
+    }
+
+    if endpoints.is_empty() {
+        let endpoint = endpoint_from_url(
+            format!("http://{local_addr}"),
+            common::v1::EndpointKind::Loopback,
+            100,
+        );
+        endpoints.insert(endpoint.url.clone(), endpoint);
+    }
+
+    endpoints.into_values().collect()
+}
+
+async fn resolve_control_plane_addr(configured_control_plane_addr: &str) -> Option<String> {
+    let port = control_plane_port(configured_control_plane_addr).unwrap_or(9090);
+    let mut candidates = Vec::new();
+
+    if !configured_control_plane_addr.is_empty() {
+        candidates.push(configured_control_plane_addr.to_string());
+    }
+
+    if is_loopback_control_plane_addr(configured_control_plane_addr) {
+        candidates.extend(
+            detect_tailscale_peer_control_plane_endpoints(port)
+                .into_iter()
+                .map(|endpoint| endpoint.url),
+        );
+        match discover_mdns_control_plane_endpoints(Duration::from_millis(750)).await {
+            Ok(endpoints) => {
+                candidates.extend(endpoints.into_iter().map(|endpoint| endpoint.url));
+            }
+            Err(error) => {
+                warn!(error = %error, "LAN discovery query failed");
+            }
+        }
+        candidates.extend(
+            detect_lan_scan_control_plane_endpoints(port)
+                .into_iter()
+                .map(|endpoint| endpoint.url),
+        );
+    }
+
+    first_verified_control_plane(dedup_urls(candidates)).await
+}
+
+fn control_plane_port(control_plane_addr: &str) -> Option<u16> {
+    Url::parse(control_plane_addr)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+}
+
+fn is_loopback_control_plane_addr(control_plane_addr: &str) -> bool {
+    let Ok(url) = Url::parse(control_plane_addr) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn dedup_urls(urls: Vec<String>) -> Vec<String> {
+    let mut deduped = BTreeMap::new();
+    for url in urls {
+        if !url.is_empty() {
+            deduped.entry(url.clone()).or_insert(url);
+        }
+    }
+    deduped.into_values().collect()
+}
+
+async fn first_verified_control_plane(candidates: Vec<String>) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let concurrency = candidates.len().min(64);
+    let mut probes = stream::iter(candidates.into_iter().map(|candidate| async move {
+        if verify_control_plane_endpoint(&candidate).await {
+            Some(candidate)
+        } else {
+            None
+        }
+    }))
+    .buffer_unordered(concurrency);
+
+    while let Some(result) = probes.next().await {
+        if result.is_some() {
+            return result;
+        }
+    }
+    None
+}
+
+async fn verify_control_plane_endpoint(endpoint: &str) -> bool {
+    let Ok(Ok(mut client)) = timeout(
+        Duration::from_millis(400),
+        control::v1::control_plane_client::ControlPlaneClient::connect(endpoint.to_string()),
+    )
+    .await
+    else {
+        return false;
+    };
+
+    let request = tonic::Request::new(control::v1::AuthenticateRequest {
+        credential: Some(control::v1::authenticate_request::Credential::ApiKey(
+            "__galactica_probe__".to_string(),
+        )),
+    });
+    match timeout(Duration::from_millis(400), client.authenticate(request)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(status)) => control_plane_probe_status_is_valid(status.code()),
+        Err(_) => false,
+    }
+}
+
+fn control_plane_probe_status_is_valid(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+    )
 }
 
 async fn enroll_node(
@@ -275,21 +470,17 @@ async fn enroll_node(
 }
 
 async fn maintain_registration(
-    control_plane_addr: &str,
-    hostname: &str,
-    agent_endpoint: &str,
-    version: &str,
-    capabilities: common::v1::NodeCapabilities,
-    system_memory: common::v1::Memory,
+    config: RegistrationConfig,
     enrolled: EnrolledIdentity,
 ) -> Result<()> {
     loop {
         match register_node(
-            control_plane_addr,
-            hostname,
-            agent_endpoint,
-            version,
-            capabilities.clone(),
+            &config.control_plane_addr,
+            &config.hostname,
+            &config.agent_endpoint,
+            &config.agent_endpoints,
+            &config.version,
+            config.capabilities.clone(),
             &enrolled,
         )
         .await
@@ -297,7 +488,7 @@ async fn maintain_registration(
             Ok(()) => {
                 info!(
                     node_id = %enrolled.node_id,
-                    agent_endpoint = %agent_endpoint,
+                    agent_endpoint = %config.agent_endpoint,
                     "node registered"
                 );
             }
@@ -308,17 +499,21 @@ async fn maintain_registration(
             }
         }
 
-        if let Err(error) =
-            report_capabilities(control_plane_addr, capabilities.clone(), &enrolled).await
+        if let Err(error) = report_capabilities(
+            &config.control_plane_addr,
+            config.capabilities.clone(),
+            &enrolled,
+        )
+        .await
         {
             warn!(error = %error, "capability report failed");
         }
 
         loop {
             let heartbeat_interval_seconds = match send_heartbeat(
-                control_plane_addr,
+                &config.control_plane_addr,
                 enrolled.node_id.clone(),
-                system_memory,
+                config.system_memory,
                 &enrolled,
             )
             .await
@@ -339,6 +534,7 @@ async fn register_node(
     control_plane_addr: &str,
     hostname: &str,
     agent_endpoint: &str,
+    agent_endpoints: &[common::v1::NetworkEndpoint],
     version: &str,
     capabilities: common::v1::NodeCapabilities,
     enrolled: &EnrolledIdentity,
@@ -354,6 +550,7 @@ async fn register_node(
             capabilities: Some(capabilities),
             version: version.to_string(),
             agent_endpoint: agent_endpoint.to_string(),
+            agent_endpoints: agent_endpoints.to_vec(),
         });
         inject_node_fingerprint(&mut request, &enrolled.fingerprint)?;
         inject_trace_context_into_tonic_request(&mut request);
@@ -553,7 +750,7 @@ mod tests {
         AcceleratorInfo, AcceleratorType, CpuArch, Memory, NetworkProfile, NodeCapabilities, OsType,
     };
 
-    use super::{EffectiveConfig, select_runtime_backend};
+    use super::{EffectiveConfig, control_plane_probe_status_is_valid, select_runtime_backend};
 
     fn test_config() -> EffectiveConfig {
         EffectiveConfig {
@@ -664,5 +861,21 @@ mod tests {
         let backend = select_runtime_backend(&test_config(), &capabilities).unwrap();
         let runtime = backend.get_capabilities().await.unwrap();
         assert_eq!(runtime.runtime_name, "llama.cpp");
+    }
+
+    #[test]
+    fn authenticate_probe_accepts_expected_control_plane_statuses() {
+        assert!(control_plane_probe_status_is_valid(
+            tonic::Code::Unauthenticated
+        ));
+        assert!(control_plane_probe_status_is_valid(
+            tonic::Code::PermissionDenied
+        ));
+        assert!(!control_plane_probe_status_is_valid(
+            tonic::Code::Unimplemented
+        ));
+        assert!(!control_plane_probe_status_is_valid(
+            tonic::Code::Unavailable
+        ));
     }
 }

@@ -7,14 +7,18 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use galactica_artifact::LocalModelRegistry;
+use galactica_common::proto::common;
 use galactica_control_plane::{
     ControlPlaneConfig, ControlPlaneServer, ControlPlaneService, GrpcNodeExecutor,
     SqliteStateStore, TenantRecord,
 };
+use galactica_networking::{
+    detect_bind_endpoints, preferred_endpoint, spawn_control_plane_mdns_advertiser,
+};
 use galactica_observability::init_tracing;
 use serde::Deserialize;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Galactica Control Plane — cluster state, scheduling, placement, artifact service
 #[derive(Parser, Debug)]
@@ -209,6 +213,24 @@ async fn main() -> Result<()> {
         tenant_id = %config.tenant_id,
         "starting control plane"
     );
+    let _mdns_advertiser = if let Some(endpoint) = select_lan_advertised_endpoint(addr.port()) {
+        match spawn_control_plane_mdns_advertiser(control_plane_hostname(), endpoint.clone()).await
+        {
+            Ok(handle) => {
+                info!(control_plane_endpoint = %endpoint, "started LAN discovery advertiser");
+                Some(handle)
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to start LAN discovery advertiser");
+                None
+            }
+        }
+    } else {
+        info!(
+            "skipping LAN discovery advertiser because no non-loopback control-plane endpoint was detected"
+        );
+        None
+    };
     Server::builder()
         .add_service(ControlPlaneServer::new(service))
         .serve(addr)
@@ -285,4 +307,36 @@ fn load_config(path: Option<&Path>) -> Result<FileConfig> {
         .with_context(|| format!("failed to read config file {}", path.display()))?;
     toml::from_str(&contents)
         .with_context(|| format!("failed to parse config file {}", path.display()))
+}
+
+fn select_lan_advertised_endpoint(port: u16) -> Option<String> {
+    let endpoints = detect_bind_endpoints(port);
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.kind == common::v1::EndpointKind::Lan as i32)
+        .or_else(|| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.kind == common::v1::EndpointKind::Wan as i32
+                    || endpoint.kind == common::v1::EndpointKind::Tailscale as i32
+            })
+        })
+        .map(|endpoint| endpoint.url.clone())
+        .or_else(|| preferred_endpoint(&endpoints))
+        .filter(|endpoint| !is_loopback_endpoint(endpoint))
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    endpoint.contains("127.0.0.1") || endpoint.contains("[::1]") || endpoint.contains("localhost")
+}
+
+fn control_plane_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "control-plane".to_string())
 }

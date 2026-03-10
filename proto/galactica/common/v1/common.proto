@@ -58,6 +58,14 @@ enum NetworkProfile {
   NETWORK_PROFILE_NATED = 4;
 }
 
+enum EndpointKind {
+  ENDPOINT_KIND_UNSPECIFIED = 0;
+  ENDPOINT_KIND_LOOPBACK = 1;
+  ENDPOINT_KIND_LAN = 2;
+  ENDPOINT_KIND_TAILSCALE = 3;
+  ENDPOINT_KIND_WAN = 4;
+}
+
 enum NodeStatus {
   NODE_STATUS_UNSPECIFIED = 0;
   NODE_STATUS_REGISTERING = 1;
@@ -100,6 +108,13 @@ message NodeCapabilities {
   map<string, string> locality = 7;
 }
 
+message NetworkEndpoint {
+  string url = 1;
+  EndpointKind kind = 2;
+  uint32 priority = 3;
+  map<string, string> metadata = 4;
+}
+
 message NodeInfo {
   NodeId node_id = 1;
   string hostname = 2;
@@ -107,6 +122,7 @@ message NodeInfo {
   NodeStatus status = 4;
   google.protobuf.Timestamp last_heartbeat = 5;
   string version = 6;
+  repeated NetworkEndpoint agent_endpoints = 7;
 }
 
 // === Model Types ===

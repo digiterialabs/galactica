@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 galactica-artifact = { workspace = true }
 galactica-common = { workspace = true }
+galactica-networking = { workspace = true }
 galactica-node-agent = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

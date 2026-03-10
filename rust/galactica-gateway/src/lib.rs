@@ -1147,6 +1147,7 @@ fn rpc_stream_unavailable(operation: &'static str) -> impl FnOnce(tonic::Status)
 
 fn node_info_json(node: common::v1::NodeInfo) -> Value {
     let capabilities = node.capabilities.unwrap_or_default();
+    let preferred_agent_endpoint = preferred_agent_endpoint_url(&node.agent_endpoints);
     json!({
         "node_id": node.node_id.map(|node_id| node_id.value).unwrap_or_default(),
         "hostname": node.hostname,
@@ -1154,6 +1155,13 @@ fn node_info_json(node: common::v1::NodeInfo) -> Value {
         "last_heartbeat": node.last_heartbeat.map(galactica_common::timestamp_to_chrono).map(|time| time.to_rfc3339()),
         "version": node.version,
         "pool": pool_label(&capabilities),
+        "preferred_agent_endpoint": preferred_agent_endpoint,
+        "agent_endpoints": node.agent_endpoints.into_iter().map(|endpoint| json!({
+            "url": endpoint.url,
+            "kind": endpoint_kind_label(endpoint.kind),
+            "priority": endpoint.priority,
+            "metadata": endpoint.metadata,
+        })).collect::<Vec<_>>(),
         "runtime_backends": capabilities.runtime_backends,
         "accelerators": capabilities.accelerators.into_iter().map(|accelerator| json!({
             "type": accelerator.r#type,
@@ -1257,6 +1265,32 @@ fn node_status_label(status: i32) -> &'static str {
         common::v1::NodeStatus::Removed => "removed",
         common::v1::NodeStatus::Unspecified => "unknown",
     }
+}
+
+fn endpoint_kind_label(kind: i32) -> &'static str {
+    match common::v1::EndpointKind::try_from(kind).unwrap_or(common::v1::EndpointKind::Unspecified)
+    {
+        common::v1::EndpointKind::Loopback => "loopback",
+        common::v1::EndpointKind::Lan => "lan",
+        common::v1::EndpointKind::Tailscale => "tailscale",
+        common::v1::EndpointKind::Wan => "wan",
+        common::v1::EndpointKind::Unspecified => "unspecified",
+    }
+}
+
+fn preferred_agent_endpoint_url(endpoints: &[common::v1::NetworkEndpoint]) -> String {
+    endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.url.is_empty())
+        .min_by(|left, right| {
+            (left.priority, left.kind, left.url.as_str()).cmp(&(
+                right.priority,
+                right.kind,
+                right.url.as_str(),
+            ))
+        })
+        .map(|endpoint| endpoint.url.clone())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1370,6 +1404,12 @@ mod tests {
                     status: common::v1::NodeStatus::Online as i32,
                     last_heartbeat: Some(galactica_common::chrono_to_timestamp(chrono::Utc::now())),
                     version: "0.1.0".to_string(),
+                    agent_endpoints: vec![common::v1::NetworkEndpoint {
+                        url: "http://100.100.100.10:50061".to_string(),
+                        kind: common::v1::EndpointKind::Tailscale as i32,
+                        priority: 10,
+                        metadata: Default::default(),
+                    }],
                 }],
                 loaded_models: vec![control::v1::LoadedModel {
                     instance_id: Some(common::v1::InstanceId {
@@ -1414,6 +1454,12 @@ mod tests {
                                         chrono::Utc::now(),
                                     )),
                                     version: "0.1.0".to_string(),
+                                    agent_endpoints: vec![common::v1::NetworkEndpoint {
+                                        url: "http://100.100.100.10:50061".to_string(),
+                                        kind: common::v1::EndpointKind::Tailscale as i32,
+                                        priority: 10,
+                                        metadata: Default::default(),
+                                    }],
                                 }),
                             },
                         )),
@@ -1623,6 +1669,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cluster.status(), StatusCode::OK);
+        let cluster_body = to_bytes(cluster.into_body(), usize::MAX).await.unwrap();
+        let cluster_body = String::from_utf8(cluster_body.to_vec()).unwrap();
+        assert!(
+            cluster_body.contains("\"preferred_agent_endpoint\":\"http://100.100.100.10:50061\"")
+        );
+        assert!(cluster_body.contains("\"kind\":\"tailscale\""));
 
         let session = app
             .clone()
@@ -1771,6 +1823,12 @@ mod tests {
             capabilities: Some(default_macos_capabilities()),
             version: "0.1.0".to_string(),
             agent_endpoint: format!("http://{node_addr}"),
+            agent_endpoints: vec![common::v1::NetworkEndpoint {
+                url: format!("http://{node_addr}"),
+                kind: common::v1::EndpointKind::Lan as i32,
+                priority: 20,
+                metadata: Default::default(),
+            }],
         });
         inject_node_fingerprint(
             &mut register,
